@@ -550,7 +550,9 @@ def patch_i2c_dma(xnu: Path):
     replace_exact(
         c,
         '#include "MTKIO.h"',
-        '#include "MTKIO.h"\nextern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);',
+        '#include "MTKIO.h"\nextern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);\n'
+        'static constexpr uint32_t kA32ApdmaRxOffset = 64;\n'
+        'static constexpr uint32_t kA32ApdmaMaxRead = 512;',
         "MTKIO.cpp: declare ml_io_map for APDMA",
     )
     replace_exact(
@@ -587,7 +589,7 @@ def patch_i2c_dma(xnu: Path):
         "\t\treturn kIOReturnBadArgument;\n"
         "\t}",
         "\t/* FTS5CU56A can return 31 queued 16-byte events in a single read. */\n"
-        "\tuint32_t maxR = (fDmaRegs != 0 && fDmaBuf != NULL) ? 512u : (uint32_t)kFIFOSize;\n"
+        "\tuint32_t maxR = (fDmaRegs != 0 && fDmaBuf != NULL) ? kA32ApdmaMaxRead : (uint32_t)kFIFOSize;\n"
         "\tif (addr > 0x7f || wlen == 0 || wlen > kFIFOSize || rlen > maxR || (rlen && rbuf == NULL)) {\n"
         "\t\treturn kIOReturnBadArgument;\n"
         "\t}",
@@ -639,17 +641,22 @@ def patch_i2c_dma(xnu: Path):
         "\t\t*(volatile uint8_t *)(fRegs + I2C_DATA_PORT) = wbuf[i];\n"
         "\t}",
         "\tif (useDma) {\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x0c) = 1; /* DMA warm RST */\n"
+        "\t\tIODelay(5);\n"
         "\t\tfor (uint32_t i = 0; i < wlen; i++) {\n"
         "\t\t\tfDmaBuf[i] = wbuf[i];\n"
         "\t\t}\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x0c) = 1; /* DMA warm RST */\n"
-        "\t\tIODelay(5);\n"
+        "\t\t/* Keep the TX opcode out of the RX slot if a read fails to fill it. */\n"
+        "\t\tfor (uint32_t i = 0; i < rlen; i++) {\n"
+        "\t\t\tfDmaBuf[kA32ApdmaRxOffset + i] = 0;\n"
+        "\t\t}\n"
+        "\t\tuint64_t rxPa = fDmaPa + kA32ApdmaRxOffset;\n"
         "\t\t*(volatile uint32_t *)(fDmaRegs + 0x00) = 0; /* INT_FLAG */\n"
         "\t\t*(volatile uint32_t *)(fDmaRegs + 0x18) = 0; /* CON = WRRD */\n"
         "\t\t*(volatile uint32_t *)(fDmaRegs + 0x1c) = (uint32_t)fDmaPa;\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x20) = (uint32_t)fDmaPa;\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x20) = (uint32_t)rxPa;\n"
         "\t\t*(volatile uint32_t *)(fDmaRegs + 0x54) = (uint32_t)(fDmaPa >> 32);\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x58) = (uint32_t)(fDmaPa >> 32);\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x58) = (uint32_t)(rxPa >> 32);\n"
         "\t\t*(volatile uint32_t *)(fDmaRegs + 0x24) = wlen;\n"
         "\t\t*(volatile uint32_t *)(fDmaRegs + 0x28) = rlen;\n"
         "\t\tOSMemoryBarrier();\n"
@@ -667,16 +674,23 @@ def patch_i2c_dma(xnu: Path):
         "\t\trbuf[i] = *(volatile uint8_t *)(fRegs + I2C_DATA_PORT);\n"
         "\t}",
         "\tif (useDma) {\n"
+        "\t\tvolatile uint32_t *dmaEn = (volatile uint32_t *)(fDmaRegs + 0x08);\n"
+        "\t\tfor (unsigned int i = 0; i < 100 && *dmaEn != 0; i++) {\n"
+        "\t\t\tIODelay(1);\n"
+        "\t\t}\n"
+        "\t\tif (*dmaEn != 0) {\n"
+        "\t\t\treturn kIOReturnTimeout;\n"
+        "\t\t}\n"
         "\t\tOSMemoryBarrier();\n"
         "\t\tfor (uint32_t i = 0; i < rlen; i++) {\n"
-        "\t\t\trbuf[i] = fDmaBuf[i];\n"
+        "\t\t\trbuf[i] = fDmaBuf[kA32ApdmaRxOffset + i];\n"
         "\t\t}\n"
         "\t} else {\n"
         "\t\tfor (uint32_t i = 0; i < rlen; i++) {\n"
         "\t\t\trbuf[i] = *(volatile uint8_t *)(fRegs + I2C_DATA_PORT);\n"
         "\t\t}\n"
         "\t}",
-        "MTKIO.cpp: copy APDMA RX buffer back to caller",
+        "MTKIO.cpp: wait for APDMA completion and copy the RX buffer back to caller",
     )
 
 
