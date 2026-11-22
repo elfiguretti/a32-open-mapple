@@ -122,6 +122,13 @@ private:
 	{
 		IODelay(4);
 	}
+	inline void sclHigh(void) const
+	{
+		pinRelease(A32_PIN_SCL);
+		for (uint32_t w = 0; w < 2000u && !pinValue(A32_PIN_SCL); w++) {
+			IODelay(1);
+		}
+	}
 
 	void pinsToGpio(void);
 	void powerOn(void);
@@ -152,9 +159,21 @@ private:
 	uint32_t fReads;
 	uint32_t fErrors;
 	uint32_t fLogCount;
+	uint32_t fStatusLogCount;
 	volatile bool fStop;
 	volatile bool fPollDone;
 };
+
+static uint32_t gA32DisplayOff;
+static uint32_t gA32TouchResetReq;
+
+extern "C" void a32_touch_display_power(int on);
+extern "C" void
+a32_touch_display_power(int on)
+{
+	__atomic_store_n(&gA32DisplayOff, on ? 0u : 1u, __ATOMIC_RELEASE);
+	__atomic_store_n(&gA32TouchResetReq, 1u, __ATOMIC_RELEASE);
+}
 
 OSDefineMetaClassAndStructors(STMTS, MappleHIDTouch);
 
@@ -234,7 +253,7 @@ void
 STMTS::i2cStart(void)
 {
 	pinRelease(A32_PIN_SDA);
-	pinRelease(A32_PIN_SCL);
+	sclHigh();
 	i2cHalf();
 	pinLow(A32_PIN_SDA);
 	i2cHalf();
@@ -247,7 +266,7 @@ STMTS::i2cStop(void)
 {
 	pinLow(A32_PIN_SDA);
 	i2cHalf();
-	pinRelease(A32_PIN_SCL);
+	sclHigh();
 	i2cHalf();
 	pinRelease(A32_PIN_SDA);
 	i2cHalf();
@@ -276,7 +295,7 @@ STMTS::i2cWriteByte(uint8_t value)
 			pinLow(A32_PIN_SDA);
 		}
 		i2cHalf();
-		pinRelease(A32_PIN_SCL);
+		sclHigh();
 		i2cHalf();
 		pinLow(A32_PIN_SCL);
 		i2cHalf();
@@ -284,7 +303,7 @@ STMTS::i2cWriteByte(uint8_t value)
 	}
 	pinRelease(A32_PIN_SDA);
 	i2cHalf();
-	pinRelease(A32_PIN_SCL);
+	sclHigh();
 	i2cHalf();
 	bool ack = !pinValue(A32_PIN_SDA);
 	pinLow(A32_PIN_SCL);
@@ -299,7 +318,7 @@ STMTS::i2cReadByte(bool ack)
 	pinRelease(A32_PIN_SDA);
 	for (unsigned i = 0; i < 8; i++) {
 		i2cHalf();
-		pinRelease(A32_PIN_SCL);
+		sclHigh();
 		i2cHalf();
 		value = (uint8_t)((value << 1) | (pinValue(A32_PIN_SDA) ? 1u : 0u));
 		pinLow(A32_PIN_SCL);
@@ -311,7 +330,7 @@ STMTS::i2cReadByte(bool ack)
 		pinRelease(A32_PIN_SDA);
 	}
 	i2cHalf();
-	pinRelease(A32_PIN_SCL);
+	sclHigh();
 	i2cHalf();
 	pinLow(A32_PIN_SCL);
 	i2cHalf();
@@ -540,6 +559,18 @@ STMTS::pollLoop(void)
 	uint32_t statsLogged = 0;
 
 	for (uint32_t tick = 0; !fStop; tick++) {
+		if (__atomic_exchange_n(&gA32TouchResetReq, 0u, __ATOMIC_ACQ_REL) != 0) {
+			releaseAll();
+			(void)ftsWrite(STM_CMD_CLEAR_ALL_EVENT, NULL, 0);
+		}
+		if (__atomic_load_n(&gA32DisplayOff, __ATOMIC_ACQUIRE) != 0) {
+			if (fActiveMask != 0) {
+				releaseAll();
+			}
+			delay_for_interval(20000, NSEC_PER_USEC);
+			continue;
+		}
+
 		uint64_t nowNs = 0;
 		absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
 
@@ -589,7 +620,12 @@ STMTS::handleEvent(const uint8_t *ev)
 	uint8_t eid = ev[0] & 0x03u;
 	if (eid == STM_EID_STATUS) {
 		uint8_t type = (ev[0] >> 2) & 0x0fu;
-		if (type == STM_STATUS_ERROR && ev[1] == STM_ERROR_QUEUE_FULL) {
+		if (fStatusLogCount < 16) {
+			fStatusLogCount++;
+			IOLog("TOUCH: FTS5CU56A status %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
+		}
+		if (type == STM_STATUS_ERROR) {
 			releaseAll();
 		} else if (type == STM_STATUS_INFO && ev[1] == STM_INFO_READY && ev[2] == STM_READY_RESET) {
 			IOLog("TOUCH: FTS5CU56A reset, restarting scan\n");

@@ -114,8 +114,8 @@ cluster_raise(const char *name, uint32_t con1_at, uint32_t elr, uint32_t dbg,
 		return true;
 	}
 
-	/* Only modify clocks/rails when they match LK's verified boot state (~1175 MHz, posdiv /2, 0.8 V). */
-	if (((con1 >> 24) & 7u) != 1u || cur_mhz < 1150u || cur_mhz > 1200u || vproc < 44u || vproc > 52u) {
+	/* Only modify clocks/rails when they match LK's verified boot state (~1086-1175 MHz, posdiv /2, 0.8 V). */
+	if (((con1 >> 24) & 7u) != 1u || cur_mhz < 1000u || cur_mhz > 1250u || vproc < 44u || vproc > 52u) {
 		printf("a32_cpufreq: %s not in expected LK state; left as is\n", name);
 		return false;
 	}

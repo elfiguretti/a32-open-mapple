@@ -557,7 +557,8 @@ def patch_framebuffer(xnu: Path):
     old_decl = """extern "C" void mtk_ufs_safe_clear(void);                /* bsd/dev/mtk_ufs.c */"""
     new_decl = """extern "C" void mtk_ufs_safe_clear(void);                /* bsd/dev/mtk_ufs.c */
 extern "C" void a32_dsi_cmd_flush_now(void);             /* bsd/dev/mtk_ufs.c (SM-A325M DSI CMD) */
-extern "C" int a32_dsi_set_brightness(uint32_t level);   /* bsd/dev/mtk_ufs.c (SM-A325M S6E3FC3 DCS) */"""
+extern "C" int a32_dsi_set_brightness(uint32_t level);   /* bsd/dev/mtk_ufs.c (SM-A325M S6E3FC3 DCS) */
+extern "C" void a32_touch_display_power(int on);         /* hid/STMTS.cpp */"""
     replace_exact(p, old_decl, new_decl, "MappleFramebuffer.cpp: declare a32 DSI helpers at top")
 
     old_pa = """#define DISP_OVL0_PA            0x14005000ull
@@ -607,6 +608,11 @@ extern "C" int a32_dsi_set_brightness(uint32_t level);   /* bsd/dev/mtk_ufs.c (S
 \t\t\tfBlWant = 0xffffffffu;
 \t\t} else if (a32_dsi_set_brightness(pl)) {"""
     replace_exact(p, old_bl, new_bl, "MappleFramebuffer.cpp: S6E3FC3 command-mode brightness via a32_dsi_set_brightness")
+
+    old_pwr = """\t\t\tIOLog("FB: display %s\\n", off ? "off" : "on");"""
+    new_pwr = """\t\t\tIOLog("FB: display %s\\n", off ? "off" : "on");
+\t\t\ta32_touch_display_power(off ? 0 : 1);"""
+    replace_exact(p, old_pwr, new_pwr, "MappleFramebuffer.cpp: notify STMTS on display power change")
 
 
 def patch_pmic(xnu: Path):
