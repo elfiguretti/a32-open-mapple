@@ -2159,6 +2159,98 @@ btif_put(const uint8_t *b, uint32_t n)
 
     replace_exact(
         wc,
+        """/* One packet on STP channel `type` in the current mode (stp_core.c mtk_wcn_stp_send_data, mand / full). */
+static bool
+stp_send(uint8_t type, const uint8_t *p, uint32_t n)
+{
+\tuint8_t h[4], c[2] = { 0, 0 };
+\th[0] = (uint8_t)(0x80 | (st.txseq << 3) | (st.full ? st.txack : 0));
+\th[1] = (uint8_t)((type << 4) | ((n >> 8) & 0xf));
+\th[2] = (uint8_t)n;
+\th[3] = st.full ? (uint8_t)(h[0] + h[1] + h[2]) : 0;
+\tif (st.full) {
+\t\tuint16_t crc = crc16(p, n);
+\t\tc[0] = (uint8_t)crc;
+\t\tc[1] = (uint8_t)(crc >> 8);
+\t\tst.txseq = (st.txseq + 1) & 7;
+\t}
+\treturn btif_put(h, 4) && btif_put(p, n) && btif_put(c, 2);
+}""",
+        """/* One packet on STP channel `type` sent as ONE contiguous AP-DMA burst (no inter-byte gaps). */
+static bool
+stp_send(uint8_t type, const uint8_t *p, uint32_t n)
+{
+\tstatic uint8_t frame[4 + 4096 + 2];
+\tif (n > 4096) {
+\t\treturn false;
+\t}
+\tuint8_t *h = frame, *c = frame + 4 + n;
+\th[0] = (uint8_t)(0x80 | (st.full ? ((st.txseq << 3) | st.txack) : 0));
+\th[1] = (uint8_t)((type << 4) | ((n >> 8) & 0xf));
+\th[2] = (uint8_t)n;
+\th[3] = st.full ? (uint8_t)(h[0] + h[1] + h[2]) : 0;
+\tif (n) {
+\t\tmemcpy(frame + 4, p, n);
+\t}
+\tif (st.full) {
+\t\tuint16_t crc = crc16(p, n);
+\t\tc[0] = (uint8_t)crc;
+\t\tc[1] = (uint8_t)(crc >> 8);
+\t\tst.txseq = (st.txseq + 1) & 7;
+\t} else {
+\t\tc[0] = 0;
+\t\tc[1] = 0;
+\t}
+\treturn btif_put(frame, 6 + n);
+}""",
+        "mt6631_wifi.c: send full STP frame in one contiguous AP-DMA transfer",
+    )
+
+    replace_exact(
+        wc,
+        """\t\tif (st.full) {
+\t\t\tst.txack = (uint8_t)((b0 >> 3) & 7);
+\t\t\tst.rxseq = (st.txack + 1) & 7;
+\t\t\tstp_ack();
+\t\t}""",
+        """\t\tif (st.full) {
+\t\t\tuint8_t seq = (uint8_t)((b0 >> 3) & 7);
+\t\t\tbool dup = (seq != st.rxseq);
+\t\t\tif (!dup) {
+\t\t\t\tst.txack = seq;
+\t\t\t\tst.rxseq = (uint8_t)((seq + 1) & 7);
+\t\t\t}
+\t\t\tstp_ack();
+\t\t\tif (dup) {
+\t\t\t\tcontinue;
+\t\t\t}
+\t\t}""",
+        "mt6631_wifi.c: handle duplicate STP frames cleanly in full mode",
+    )
+
+    replace_exact(
+        wc,
+        """\tint rn = wmt_cmd("read 0x80000008", regrd, sizeof(regrd), regrdEv, sizeof(regrdEv), 1000, ev, sizeof(ev), out, len, &o);
+\tif (rn < 0) {
+\t\treturn o;
+\t}""",
+        """\tint rn = -1;
+\tfor (int tries = 0; tries < 3 && rn < 0; tries++) {
+\t\tif (tries > 0) {
+\t\t\tbtif_wake();
+\t\t\tdelay(20000);
+\t\t}
+\t\trn = wmt_cmd("read 0x80000008", regrd, sizeof(regrd), regrdEv, sizeof(regrdEv), 1000, ev, sizeof(ev), out, len, &o);
+\t}
+\tif (rn < 0) {
+\t\treturn o;
+\t}
+\tdelay(10000);""",
+        "mt6631_wifi.c: retry initial WMT read 0x80000008 up to 3 times + 10 ms settle",
+    )
+
+    replace_exact(
+        wc,
         """\tif (rn >= 16) {
 \t\tsay("wmt: GEN_HCR 0x%02x%02x%02x%02x (the MCU answers over STP/BTIF)\\n", ev[15], ev[14], ev[13], ev[12]);
 \t}
