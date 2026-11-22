@@ -1,0 +1,102 @@
+Panfrost (Bifrost): support sparse vertex attribute indices (driver_location).
+
+Metal (mapple_gpu_mali) assigns sparse vertex attribute locations matching
+[[attribute(n)]] (for example CoreAnimation fixed_vert_lph_spc reading
+attribute 0 = position and attribute 3 = color, with attributes 1..2 unused)
+and passes num_elements = last_attrib + 1 (4) to create_vertex_elements_state.
+
+Valhall uploads all so->num_elements attributes directly, so sparse indices
+work. On Bifrost (PAN_ARCH <= 7), pan_compiler.c computed
+info->attributes_read_count = util_bitcount64(s->info.inputs_read) (= 2),
+which both set RSD.shader.attribute_count = 2 and made
+panfrost_emit_vertex_data() stop after slot 1, leaving slot 3 uninitialized
+and out of bounds for LD_ATTR_IMM attribute_index:3 (reading zeros / black
+for solid-color fills, wallpapers, widgets, and Settings cell interiors).
+
+Compute attributes_read_count from the highest attribute index read on
+PAN_ARCH < 9 and emit all bound vertex elements in panfrost_emit_vertex_data().
+
+diff --git a/src/gallium/drivers/panfrost/pan_cmdstream.c b/src/gallium/drivers/panfrost/pan_cmdstream.c
+index bcb3abe..d2e36f8 100644
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
+@@ -2516,12 +2516,13 @@ panfrost_emit_vertex_data(struct panfrost_batch *batch, uint64_t *buffers)
+     * addressing modes and now base is 64 aligned.
+     */
+ 
+-   /* While these are usually equal, they are not required to be. In some
+-    * cases, u_blitter passes too high a value for num_elements.
++   /* Emit every bound vertex element so sparse driver_locations (e.g. Metal
++    * [[attribute(3)]] when attributes 1..2 are unused) are populated and
++    * within RSD.shader.attribute_count.
+     */
+-   assert(vs->info.attributes_read_count <= so->num_elements);
++   unsigned emit_count = MIN2(so->num_elements, attrib_array_size);
+ 
+-   for (unsigned i = 0; i < vs->info.attributes_read_count; ++i) {
++   for (unsigned i = 0; i < emit_count; ++i) {
+       unsigned vbi = so->pipe[i].vertex_buffer_index;
+       struct pipe_vertex_buffer *buf = &ctx->vertex_buffers[vbi];
+ 
+@@ -2548,6 +2549,13 @@ panfrost_emit_vertex_data(struct panfrost_batch *batch, uint64_t *buffers)
+       }
+    }
+ 
++#if PAN_ARCH >= 6
++   for (unsigned i = emit_count; i < vs->info.attributes_read_count; ++i) {
++      pan_pack(out + i, ATTRIBUTE, cfg)
++         cfg.format = MALI_PACK_FMT(CONSTANT, 0000, L);
++   }
++#endif
++
+    *buffers = S.gpu;
+    return T.gpu;
+ }
+diff --git a/src/panfrost/compiler/pan_compiler.c b/src/panfrost/compiler/pan_compiler.c
+index cd6f231..241d664 100644
+--- a/src/panfrost/compiler/pan_compiler.c
++++ b/src/panfrost/compiler/pan_compiler.c
+@@ -219,9 +219,33 @@ pan_shader_update_info(struct pan_shader_info *info, nir_shader *s,
+    info->separable = s->info.separate_shader;
+ 
+    switch (info->stage) {
+-   case MESA_SHADER_VERTEX:
++   case MESA_SHADER_VERTEX: {
+       info->attributes_read = s->info.inputs_read;
+-      info->attributes_read_count = util_bitcount64(info->attributes_read);
++      unsigned max_attrib = util_bitcount64(info->attributes_read);
++      if (arch < 9) {
++         max_attrib = MAX2(
++            max_attrib,
++            util_last_bit64(info->attributes_read >> VERT_ATTRIB_GENERIC0));
++         nir_foreach_function_impl(impl, s) {
++            nir_foreach_block(block, impl) {
++               nir_foreach_instr(instr, block) {
++                  if (instr->type != nir_instr_type_intrinsic)
++                     continue;
++                  nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++                  if (intr->intrinsic == nir_intrinsic_load_input ||
++                      intr->intrinsic == nir_intrinsic_load_attribute_pan) {
++                     unsigned range = nir_intrinsic_has_range(intr)
++                                         ? MAX2(nir_intrinsic_range(intr), 1u)
++                                         : 1u;
++                     unsigned end = nir_intrinsic_base(intr) + range;
++                     if (end <= 32)
++                        max_attrib = MAX2(max_attrib, end);
++                  }
++               }
++            }
++         }
++      }
++      info->attributes_read_count = max_attrib;
+       info->attribute_count = info->attributes_read_count;
+ 
+       if (arch <= 5) {
+@@ -239,6 +263,7 @@ pan_shader_update_info(struct pan_shader_info *info, nir_shader *s,
+       info->vs.writes_point_size =
+          s->info.outputs_written & VARYING_BIT_PSIZ;
+       break;
++   }
+    case MESA_SHADER_FRAGMENT:
+       if (s->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_DEPTH))
+          info->fs.writes_depth = true;
