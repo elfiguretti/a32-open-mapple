@@ -87,7 +87,7 @@ public:
 protected:
 	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString("FTS5CU56A"); }
 private:
-	enum class ReadMode { Interrupt, Watch, ConfirmLoss };
+	enum class ReadMode { Interrupt, Watch };
 	static void interruptOccurred(OSObject *owner, IOInterruptEventSource *src, int count);
 	static void retryInterrupt(OSObject *owner, IOTimerEventSource *timer);
 	static void watchActiveContacts(OSObject *owner, IOTimerEventSource *timer);
@@ -115,7 +115,6 @@ private:
 	uint32_t fErrors;
 	uint32_t fLogCount;
 	bool fSawInterrupt;
-	bool fConfirmLostEvent;
 };
 
 OSDefineMetaClassAndStructors(STMTS, MappleHIDTouch);
@@ -359,12 +358,7 @@ STMTS::interruptOccurred(OSObject *owner, IOInterruptEventSource *src __unused, 
 void
 STMTS::retryInterrupt(OSObject *owner, IOTimerEventSource *timer __unused)
 {
-	STMTS *self = static_cast<STMTS *>(owner);
-	if (self->fConfirmLostEvent) {
-		self->fConfirmLostEvent = false;
-		self->readEvents(ReadMode::ConfirmLoss);
-	}
-	self->fInterrupt->enable();
+	static_cast<STMTS *>(owner)->fInterrupt->enable();
 }
 
 void
@@ -403,7 +397,7 @@ void
 STMTS::readEvents(ReadMode mode)
 {
 	int irqLevel;
-	bool asserted = mode != ReadMode::ConfirmLoss && fActiveMask != 0 &&
+	bool asserted = mode == ReadMode::Watch &&
 	    mapple_gpio_get(A32_TSP_IRQ_GPIO, &irqLevel) == 0 && irqLevel == 0;
 	uint8_t events[STM_MAX_EVENTS_PER_IRQ][STM_EVENT_SIZE];
 	uint32_t count;
@@ -416,22 +410,20 @@ STMTS::readEvents(ReadMode mode)
 			IOLog("TOUCH: FTS5CU56A EINT10 %s (0x%x)\n",
 			    kr == kIOReturnSuccess ? "with empty FIFO" : "event read failed", kr);
 		}
-		if (mode == ReadMode::ConfirmLoss && fActiveMask != 0) {
-			IOLog("TOUCH: FTS5CU56A missing FIFO record, releasing active contacts\n");
-		}
-		if (kr != kIOReturnSuccess || mode == ReadMode::ConfirmLoss) {
+		if (kr != kIOReturnSuccess) {
 			releaseAll();
 		}
 		if (mode != ReadMode::Interrupt) {
 			return;
 		}
-		// An already deasserted GPIO can leave a harmless stale IRQ. Only check
-		// for a lost record if the read deasserted an IRQ that signalled data.
-		fConfirmLostEvent = kr == kIOReturnSuccess && asserted &&
-		    mapple_gpio_get(A32_TSP_IRQ_GPIO, &irqLevel) == 0 && irqLevel != 0;
-		// Keep a stuck active-low line from immediately retriggering on an empty or failed read.
+		// EINT can report an empty FIFO between valid records. Once GPIO10 is
+		// high, the IRQ can be rearmed immediately and the contacts stay down.
+		if (kr == kIOReturnSuccess && mapple_gpio_get(A32_TSP_IRQ_GPIO, &irqLevel) == 0 && irqLevel != 0) {
+			return;
+		}
+		// Back off only a failed read or a line that is still asserted.
 		fInterrupt->disable();
-		fRetryTimer->setTimeoutMS(fConfirmLostEvent ? 4 : 20);
+		fRetryTimer->setTimeoutMS(20);
 		return;
 	}
 	for (uint32_t i = 0; i < count; i++) {
