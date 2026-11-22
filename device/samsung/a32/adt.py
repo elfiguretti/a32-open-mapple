@@ -19,7 +19,12 @@ ABOUT = dict(serial='MAPPLE0000000000', model='SM-A325M', region='PSN', regulato
 
 
 def devices(a, ph, phandle, gic_ph, ecid, flags):
-    """/arm-io devices for SM-A325M (MT6769T / mt6768), verified against live.dtb."""
+    """/arm-io devices for SM-A325M (MT6769T / mt6768), verified against live.dtb.
+
+    Compatible strings match xnu_kernel_mediatek_common/iokit/KernelConfigTables.cpp
+    because MT6768/MT6769T shares the same Keypad, EINT, PWRAP, MT6358 PMIC, GPIO,
+    I2C v2, and CONNSYS MT6631 register layouts as MT6781.
+    """
     node, cstr, u32, spi, io, wifi_mac = a.node, a.cstr, a.u32, a.spi, a.io, a.wifi_mac
     IRQ_EDGE_RISING, IRQ_EDGE_FALLING, IRQ_LEVEL_HIGH = a.IRQ_EDGE_RISING, a.IRQ_EDGE_FALLING, a.IRQ_LEVEL_HIGH
     HID_CSMR_POWER, HID_CSMR_VOLUME_UP, HID_CSMR_VOLUME_DOWN = a.HID_CSMR_POWER, a.HID_CSMR_VOLUME_UP, a.HID_CSMR_VOLUME_DOWN
@@ -30,7 +35,7 @@ def devices(a, ph, phandle, gic_ph, ecid, flags):
         # Power (PWRKEY) and Volume Down (HOMEKEY / kpd-sw-rstkey=0x72) sit on the MT6358 PMIC.
         node('keypad', [
             ph(),
-            ('compatible', cstr('mediatek,mt6768-keypad')),
+            ('compatible', cstr('mediatek,mt6781-keypad')),
             ('reg', io(0x10010000, 0x1000)),
             ('interrupt-parent', u32(gic_ph)),
             ('interrupts', spi(0x49, IRQ_EDGE_RISING)),
@@ -39,7 +44,7 @@ def devices(a, ph, phandle, gic_ph, ecid, flags):
         # EINT controller @ 0x1000b000 (SPI 0xba, same block as MT6781).
         node('eint', [
             ('AAPL,phandle', u32(eint_ph)),
-            ('compatible', cstr('mediatek,mt6768-eint')),
+            ('compatible', cstr('mediatek,mt6781-eint')),
             ('reg', io(0x1000b000, 0x1000)),
             ('interrupt-controller', b''),
             ('#interrupt-cells', u32(2)),
@@ -49,48 +54,53 @@ def devices(a, ph, phandle, gic_ph, ecid, flags):
         # PWRAP @ 0x1000d000 -> MT6358 PMIC (EINT 144 / 0x90): PWRKEY = power, HOMEKEY = volume down.
         node('pwrap', [
             ph(),
-            ('compatible', cstr('mediatek,mt6768-pwrap')),
+            ('compatible', cstr('mediatek,mt6781-pwrap')),
             ('reg', io(0x1000d000, 0x1000)),
         ], [node('pmic', [
             ph(),
-            ('compatible', cstr('mediatek,mt6358-pmic')),
+            ('compatible', cstr('mediatek,mt6366-pmic')),
             ('interrupt-parent', u32(eint_ph)),
             ('interrupts', u32(144, IRQ_LEVEL_HIGH)),
         ], [node('keys', [
             ph(),
-            ('compatible', cstr('mediatek,mt6358-keys')),
+            ('compatible', cstr('mediatek,mt6366-keys')),
             ('keymap', u32(0, HID_CSMR_POWER, 1, HID_CSMR_VOLUME_DOWN)),
         ])])]),
         # GPIO controller @ 0x10005000.
         node('gpio', [
             ph(),
-            ('compatible', cstr('mediatek,mt6768-gpio')),
+            ('compatible', cstr('mediatek,mt6781-gpio')),
             ('reg', io(0x10005000, 0x1000)),
         ]),
-        # I2C6 @ 0x1100d000 (DMA @ 0x11000600, SPI 0x94) hosting STMicroelectronics FTS5CU56A touchscreen @ 0x49.
+        # I2C6 @ 0x1100d000 (SPI 0x94, i2c_common ver=2, ext_time_config=0x1801, clock-div=5,
+        # source-clock=univpll3_d4=124.8 MHz). Clock gate is in infracfg_ao (ungated by a32_console_hw_init),
+        # so imp-cg-bit is omitted. Hosts STMicroelectronics FTS5CU56A touchscreen @ 0x49 as a MappleDTNub child.
         node('i2c6', [
             ph(),
-            ('compatible', cstr('mediatek,mt6768-i2c')),
-            ('reg', io(0x1100d000, 0x1000) + io(0x11000600, 0x1000)),
+            ('compatible', cstr('mediatek,mt6781-i2c')),
+            ('reg', io(0x1100d000, 0x1000)),
             ('interrupt-parent', u32(gic_ph)),
             ('interrupts', spi(0x94, IRQ_LEVEL_HIGH)),
             ('bus-id', u32(6)),
             ('clock-frequency', u32(400000)),
+            ('source-clock', u32(124800000)),
             ('clock-div', u32(5)),
+            ('ext-time-config', u32(0x1801)),
+        ], [
+            # STMicroelectronics FTS5CU56A touch (iokit/Kernel/arm/hid/STMTS.cpp):
+            # I2C6 @ 0x49, IRQ EINT 10 (falling edge), sec,max_coords = 4096x4096, flash-resident FW.
+            node('touch', [
+                ph(),
+                ('compatible', cstr('stm,stm_ts')),
+                ('i2c-address', u32(0x49)),
+                ('interrupt-parent', u32(eint_ph)),
+                ('interrupts', u32(10, IRQ_EDGE_FALLING)),
+                ('max-x', u32(4096)),
+                ('max-y', u32(4096)),
+                ('panel-size', u32(FB['width'], FB['height'])),
+            ]),
         ]),
-        # STMicroelectronics FTS5CU56A touch (stm,stm_ts) on i2c6 @ 0x49, IRQ GPIO/EINT 10, coords 4096x4096.
-        node('touch', [
-            ph(),
-            ('compatible', cstr('stm,stm_ts')),
-            ('bus-id', u32(6)),
-            ('i2c-addr', u32(0x49)),
-            ('interrupt-parent', u32(eint_ph)),
-            ('interrupts', u32(10, IRQ_EDGE_FALLING)),
-            ('max-x', u32(4095)),
-            ('max-y', u32(4095)),
-            ('panel-size', u32(FB['width'], FB['height'])),
-        ]),
-        # eMMC MSDC0 @ 0x11230000 (SPI 0x64), 128 GB SAMSUNG DV6DAB.
+        # eMMC MSDC0 @ 0x11230000 (SPI 0x64), 128 GB SAMSUNG DV6DAB (bsd/dev/mtk_emmc.c).
         node('emmc', [
             ph(),
             ('compatible', cstr('mediatek,mt6768-msdc0')),
@@ -100,9 +110,10 @@ def devices(a, ph, phandle, gic_ph, ecid, flags):
         ]),
         # Mali-G52 MC2 (Bifrost): mali@13040000, mfg_cfg@13000000, spm@10006000, topckgen@10000000,
         # apmixed@1000c000, infracfg_ao@10001000; IRQs SPI 0x112 (GPU), 0x113 (MMU), 0x114 (JOB).
+        # MappleGPU.cpp stays idle unless boot-arg mp_gpu=1|2 is explicitly passed.
         node('gpu', [
             ph(),
-            ('compatible', cstr('mediatek,mt6768-mali')),
+            ('compatible', cstr('mediatek,mt6781-mali')),
             ('reg', io(0x13040000, 0x4000) + io(0x13000000, 0x1000) + io(0x10006000, 0x1000) +
                     io(0x10000000, 0x1000) + io(0x1000c000, 0x1000) + io(0x10001000, 0x1000)),
             ('interrupt-parent', u32(gic_ph)),
@@ -112,7 +123,7 @@ def devices(a, ph, phandle, gic_ph, ecid, flags):
         node('wlan', [
             ph(),
             ('device_type', cstr('wlan')),
-            ('compatible', cstr('mediatek,mt6768-wlan')),
+            ('compatible', cstr('mediatek,mt6781-wlan')),
             ('local-mac-address', wifi_mac(ecid)),
             ('wifi-vendor', cstr('Murata')),
         ]),

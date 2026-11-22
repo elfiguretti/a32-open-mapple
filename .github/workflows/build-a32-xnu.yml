@@ -73,7 +73,8 @@ jobs:
           done
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        id: ccache-restore
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.ccache
           key: a32-ccache-${{ env.KERNEL_CONFIG }}-${{ hashFiles('kernel/**', '.github/workflows/build-a32-xnu.yml') }}
@@ -147,13 +148,21 @@ jobs:
             --check-abs upstream/mapple_build/tools/check-abs.py \
             --out dist/shim-a32.Image
 
-          # 3) Pack MAPPLEPL payload (safe Hito 3 early boot cmdline: 1.74 GB top bank, live AMOLED + ramoops)
-          CMDLINE="mp_mem4g=0 mp_cpufreq=0 mp_therm=0 mp_gpu=0 mp_touch=0 mp_wifi_steps=0 mp_bt_steps=0 mp_fb_noconsole=0 mp_conlog=1 cpus=4 debug=0x14e serial=3 -v ${{ inputs.extra_cmdline }}"
+          # 3) Pack MAPPLEPL payload (safe Hito 3+5 early boot cmdline: 1.74 GB top bank, live AMOLED + ramoops + FTS5CU56A touch probe)
+          CMDLINE="mp_mem4g=0 mp_cpufreq=0 mp_therm=0 mp_gpu=0 mp_touch=1 mp_wifi_steps=0 mp_bt_steps=0 mp_fb_noconsole=0 mp_conlog=1 cpus=4 debug=0x14e serial=3 -v ${{ inputs.extra_cmdline }}"
           python3 upstream/mapple_build/tools/mkpayload.py dist/kernel dist/a32.adt dist/xnu-a32.bin --cmdline "$CMDLINE"
           echo "$CMDLINE" > dist/cmdline.txt
 
           (cd dist && shasum -a 256 kernel a32.adt shim-a32.Image xnu-a32.bin > SHA256SUMS)
           ls -lh dist/
+
+      - name: Save ccache (always, so even failed builds warm the cache)
+        if: always() && steps.ccache-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
 
       - name: Publish SM-A325M XNU Hito 3 Release (uses 0 Actions artifact storage!)
         env:

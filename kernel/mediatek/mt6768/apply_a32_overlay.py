@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
 """
 Deterministic, self-verifying XNU source overlay for Samsung Galaxy A32 4G (SM-A325M,
-MT6769T / mt6768, S6E3FC3 Super AMOLED DSI CMD) on top of Open Mapple's
-xnu_kernel_mediatek_common + xnu_kernel_mediatek_mt6781.
+MT6769T / mt6768, S6E3FC3 Super AMOLED DSI CMD, eMMC MSDC0, STM FTS5CU56A touch)
+on top of Open Mapple's xnu_kernel_mediatek_common + xnu_kernel_mediatek_mt6781.
 
-Applies 3 minimal, silicon-verified changes:
-  1) bsd/dev/mtk_ufs.c:
-     - Adds a32_console_hw_init() and a32_dsi_cmd_flush_now() mapping ramoops (0x4d09f000),
+Applies:
+  1) Copies SM-A325M MT6768 drivers into the XNU tree:
+     - bsd/dev/mtk_emmc.c (Hito 4: MSDC0 @ 0x11230000 PIO block device, HFS+/HFSX/APFS, /dev/emmc0)
+     - iokit/Kernel/arm/hid/STMTS.cpp (Hito 5: STMicroelectronics FTS5CU56A on i2c6 @ 0x49, EINT 10)
+  2) Registers both drivers in bsd/conf/files, iokit/conf/files.arm64, iokit/KernelConfigTables.cpp,
+     and hooks rd=emmc0 in iokit/bsddev/IOKitBSDInit.cpp.
+  3) Patches bsd/dev/mtk_ufs.c:
+     - Adds a32_console_hw_init() and a32_dsi_cmd_flush_now(): maps ramoops (0x4d09f000),
+       infracfg_ao (0x10001000 -> ungates CLK_IFR_I2C_AP, CLK_IFR_I2C6, CLK_IFR_AP_MSDC0),
        OVL0 (0x1400b000), DISP_MUTEX (0x14001000), and DSI0 (0x14014000) via ml_io_map().
      - Mirrors all console output from mapple_log_append() into ramoops (survives warm reset
        -> /sys/fs/pstore/console-ramoops-2) and triggers the 7-write MT6768 DSI CMD flush on
-       newlines (rate-limited) so XNU boot logs scroll live on the S6E3FC3 AMOLED!
-  2) iokit/Kernel/arm/MapplePlatformExpert.cpp:
-     - Calls a32_console_hw_init() at the very start of MapplePlatformExpert::start() so early
-       Mach + IOKit + BSD boot logs immediately flush to ramoops and the AMOLED panel.
-  3) iokit/Kernel/arm/MappleFramebuffer.cpp:
+       newlines (rate-limited) so XNU boot logs scroll live on the S6E3FC3 AMOLED.
+     - Falls back to mtk_emmc_read_root()/mtk_emmc_read_part() when UFS is not present.
+  4) Patches iokit/Kernel/arm/MapplePlatformExpert.cpp:
+     - Calls a32_console_hw_init() at the very start of MapplePlatformExpert::start().
+  5) Patches iokit/Kernel/arm/MappleFramebuffer.cpp:
+     - Declares a32_dsi_cmd_flush_now() at the top of the file (before AppleCLCD::presentQueued).
      - Updates DISP_OVL0_PA/OVL0_2L/RDMA0/DSI0/SMI_LARB1/CCORR0 to verified MT6768 bases.
      - Calls a32_dsi_cmd_flush_now() whenever AppleCLCD::presentQueued() presents a frame.
 """
+import shutil
 import sys
 from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
 
 
 def replace_exact(path: Path, old: str, new: str, label: str):
@@ -36,8 +46,139 @@ def replace_exact(path: Path, old: str, new: str, label: str):
     print(f"  [ok] {label}")
 
 
+def copy_drivers(xnu: Path):
+    copies = [
+        (HERE / "bsd" / "dev" / "mtk_emmc.c", xnu / "bsd" / "dev" / "mtk_emmc.c"),
+        (HERE / "iokit" / "Kernel" / "arm" / "hid" / "STMTS.cpp",
+         xnu / "iokit" / "Kernel" / "arm" / "hid" / "STMTS.cpp"),
+    ]
+    for src, dst in copies:
+        if not src.is_file():
+            raise SystemExit(f"ERROR: missing driver source {src}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        print(f"  [copy] {dst.relative_to(xnu)}")
+
+
+def patch_build_lists(xnu: Path):
+    replace_exact(
+        xnu / "bsd" / "conf" / "files",
+        "bsd/dev/mtk_ufs.c\t\t\tstandard",
+        "bsd/dev/mtk_ufs.c\t\t\tstandard\nbsd/dev/mtk_emmc.c\t\t\tstandard",
+        "bsd/conf/files: add bsd/dev/mtk_emmc.c",
+    )
+    replace_exact(
+        xnu / "iokit" / "conf" / "files.arm64",
+        "iokit/Kernel/arm/hid/GT9896.cpp                              optional iokitcpp",
+        "iokit/Kernel/arm/hid/GT9896.cpp                              optional iokitcpp\n"
+        "iokit/Kernel/arm/hid/STMTS.cpp                               optional iokitcpp",
+        "iokit/conf/files.arm64: add iokit/Kernel/arm/hid/STMTS.cpp",
+    )
+    replace_exact(
+        xnu / "iokit" / "KernelConfigTables.cpp",
+        '    "   {"\n'
+        '    "     \'IOClass\'         = GT9896;"\n'
+        '    "     \'IOProviderClass\' = MappleDTNub;"\n'
+        '    "     \'IONameMatch\'     = \'goodix,gt9896\';"\n'
+        '    "   },"',
+        '    "   {"\n'
+        '    "     \'IOClass\'         = GT9896;"\n'
+        '    "     \'IOProviderClass\' = MappleDTNub;"\n'
+        '    "     \'IONameMatch\'     = \'goodix,gt9896\';"\n'
+        '    "   },"\n'
+        '    "   {"\n'
+        '    "     \'IOClass\'         = STMTS;"\n'
+        '    "     \'IOProviderClass\' = MappleDTNub;"\n'
+        '    "     \'IONameMatch\'     = \'stm,stm_ts\';"\n'
+        '    "   },"',
+        "iokit/KernelConfigTables.cpp: register STMTS (stm,stm_ts)",
+    )
+    replace_exact(
+        xnu / "iokit" / "bsddev" / "IOKitBSDInit.cpp",
+        '\tif (strcmp(rdBootVar, "ufsroot0") == 0) {\n'
+        '\t\textern int mtk_ufs_rootdev(dev_t *dev);\n'
+        '\t\tOSSafeReleaseNULL(matching);\n'
+        '\t\tint ufs_error = mtk_ufs_rootdev(root);\n'
+        '\t\tif (ufs_error) {\n'
+        '\t\t\tpanic("IOFindBSDRoot: MT6781 UFS root %s unavailable: %d", rdBootVar, ufs_error);\n'
+        '\t\t}\n'
+        '\t\tstrlcpy(rootName, rdBootVar, rootNameSize);\n'
+        '\t\tIOLog("BSD root: %s, major %d, minor %d\\n", rootName, major(*root), minor(*root));\n'
+        '\t\t*oflags = 0;\n'
+        '\t\tgoto iofrootx;\n'
+        '\t}',
+        '\tif (strcmp(rdBootVar, "ufsroot0") == 0) {\n'
+        '\t\textern int mtk_ufs_rootdev(dev_t *dev);\n'
+        '\t\tOSSafeReleaseNULL(matching);\n'
+        '\t\tint ufs_error = mtk_ufs_rootdev(root);\n'
+        '\t\tif (ufs_error) {\n'
+        '\t\t\tpanic("IOFindBSDRoot: MT6781 UFS root %s unavailable: %d", rdBootVar, ufs_error);\n'
+        '\t\t}\n'
+        '\t\tstrlcpy(rootName, rdBootVar, rootNameSize);\n'
+        '\t\tIOLog("BSD root: %s, major %d, minor %d\\n", rootName, major(*root), minor(*root));\n'
+        '\t\t*oflags = 0;\n'
+        '\t\tgoto iofrootx;\n'
+        '\t}\n'
+        '\tif (strcmp(rdBootVar, "emmc0") == 0) {\n'
+        '\t\textern int mtk_emmc_rootdev(dev_t *dev);\n'
+        '\t\tOSSafeReleaseNULL(matching);\n'
+        '\t\tint emmc_error = mtk_emmc_rootdev(root);\n'
+        '\t\tif (emmc_error) {\n'
+        '\t\t\tpanic("IOFindBSDRoot: MT6768 eMMC root %s unavailable: %d", rdBootVar, emmc_error);\n'
+        '\t\t}\n'
+        '\t\tstrlcpy(rootName, rdBootVar, rootNameSize);\n'
+        '\t\tIOLog("BSD root: %s, major %d, minor %d\\n", rootName, major(*root), minor(*root));\n'
+        '\t\t*oflags = 0;\n'
+        '\t\tgoto iofrootx;\n'
+        '\t}',
+        "iokit/bsddev/IOKitBSDInit.cpp: hook rd=emmc0 via mtk_emmc_rootdev",
+    )
+
+
 def patch_mtk_ufs(xnu: Path):
     p = xnu / "bsd" / "dev" / "mtk_ufs.c"
+
+    # 1) Fall back to mtk_emmc when UFS is absent (Wi-Fi firmware tail + usb_link partition reads)
+    old_read_part = """int
+mtk_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len, uint64_t *sizep)
+{
+\tstatic char cached[37];
+\tstatic uint64_t cfirst, cblocks;
+\tint error = 0;
+
+\tif (!su.ready) {
+\t\treturn ENXIO;
+\t}"""
+    new_read_part = """extern int mtk_emmc_read_part(const char *name, uint64_t off, void *buf, uint32_t len, uint64_t *sizep);
+extern int mtk_emmc_read_root(uint64_t off, void *buf, uint32_t len, uint64_t *sizep);
+
+int
+mtk_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len, uint64_t *sizep)
+{
+\tstatic char cached[37];
+\tstatic uint64_t cfirst, cblocks;
+\tint error = 0;
+
+\tif (!su.ready) {
+\t\treturn mtk_emmc_read_part(name, off, buf, len, sizep);
+\t}"""
+    replace_exact(p, old_read_part, new_read_part, "mtk_ufs.c: mtk_emmc_read_part fallback")
+
+    old_read_root = """int
+mtk_ufs_read_root(uint64_t off, void *buf, uint32_t len, uint64_t *sizep)
+{
+\tif (!su.ready) {
+\t\treturn ENXIO;
+\t}"""
+    new_read_root = """int
+mtk_ufs_read_root(uint64_t off, void *buf, uint32_t len, uint64_t *sizep)
+{
+\tif (!su.ready) {
+\t\treturn mtk_emmc_read_root(off, buf, len, sizep);
+\t}"""
+    replace_exact(p, old_read_root, new_read_root, "mtk_ufs.c: mtk_emmc_read_root fallback")
+
+    # 2) Live ramoops + infracfg_ao clock ungate + S6E3FC3 DSI CMD flush
     old = """/* Called for all console output, any context: never blocks. */
 void mapple_log_append(const char *c, int size);
 
@@ -53,10 +194,13 @@ mapple_log_append(const char *c, int size)
 \t}
 }"""
 
-    new = """/* ---- SM-A325M (MT6769T): live ramoops console + S6E3FC3 DSI CMD AMOLED flush ---- */
+    new = """/* ---- SM-A325M (MT6769T): live ramoops console + clock gates + S6E3FC3 DSI CMD flush ---- */
 #define A32_RAMOOPS_PA       0x4d09f000UL
 #define A32_RAMOOPS_SIZE     0x40000U
 #define A32_RAMOOPS_SIG      0x43474244U /* "DBGC" */
+#define A32_INFRACFG_PA      0x10001000UL
+#define A32_IFR2_CG_CLR      0x084U      /* bit 11 = CLK_IFR_I2C_AP */
+#define A32_IFR5_CG_CLR      0x0c4U      /* bit 6 = CLK_IFR_I2C6, bit 7 = CLK_IFR_AP_MSDC0 */
 #define A32_OVL0_PA          0x1400b000UL
 #define A32_MUTEX_PA         0x14001000UL
 #define A32_DSI0_PA          0x14014000UL
@@ -146,6 +290,15 @@ a32_console_hw_init(void)
 \ta32_ovl0_va    = ml_io_map(A32_OVL0_PA, 0x1000);
 \ta32_mutex_va   = ml_io_map(A32_MUTEX_PA, 0x1000);
 \ta32_dsi0_va    = ml_io_map(A32_DSI0_PA, 0x1000);
+
+\t/* Ensure MT6768 infracfg_ao clock gates for I2C6 (touch) and MSDC0 (eMMC) are open */
+\tvm_offset_t infra = ml_io_map(A32_INFRACFG_PA, 0x1000);
+\tif (infra != 0) {
+\t\ta32_io_wr32(infra, A32_IFR2_CG_CLR, (1u << 11));
+\t\ta32_io_wr32(infra, A32_IFR5_CG_CLR, (1u << 6) | (1u << 7));
+\t\t__asm__ volatile("dsb sy" ::: "memory");
+\t}
+
 \ta32_hw_ready   = 1;
 
 \t/* Replay early Mach console bytes buffered before IOKit started into ramoops */
@@ -188,7 +341,7 @@ mapple_log_append(const char *c, int size)
 \t\t}
 \t}
 }"""
-    replace_exact(p, old, new, "mtk_ufs.c: a32 ramoops + DSI CMD live console")
+    replace_exact(p, old, new, "mtk_ufs.c: a32 ramoops + infracfg gates + DSI CMD live console")
 
 
 def patch_platform_expert(xnu: Path):
@@ -212,12 +365,18 @@ MapplePlatformExpert::start(IOService *provider)
 
 def patch_framebuffer(xnu: Path):
     p = xnu / "iokit" / "Kernel" / "arm" / "MappleFramebuffer.cpp"
+
+    # Forward-declare a32_dsi_cmd_flush_now near the top of the file (before AppleCLCD::presentQueued!)
+    old_decl = """extern "C" void mtk_ufs_safe_clear(void);                /* bsd/dev/mtk_ufs.c */"""
+    new_decl = """extern "C" void mtk_ufs_safe_clear(void);                /* bsd/dev/mtk_ufs.c */
+extern "C" void a32_dsi_cmd_flush_now(void);             /* bsd/dev/mtk_ufs.c (SM-A325M DSI CMD) */"""
+    replace_exact(p, old_decl, new_decl, "MappleFramebuffer.cpp: declare a32_dsi_cmd_flush_now at top")
+
     old_pa = """#define DISP_OVL0_PA            0x14005000ull
 #define DISP_OVL0_2L_PA         0x14006000ull
 #define SMI_LARB0_PA            0x14003000ull
 #define SMI_LARB1_PA            0x14004000ull"""
     new_pa = """/* SM-A325M (MT6769T / mt6768) verified display MMIO addresses */
-extern "C" void a32_dsi_cmd_flush_now(void);
 #define DISP_OVL0_PA            0x1400b000ull
 #define DISP_OVL0_2L_PA         0x1400c000ull
 #define SMI_LARB0_PA            0x14003000ull
@@ -251,7 +410,9 @@ def main():
     if len(sys.argv) != 2:
         raise SystemExit("Usage: apply_a32_overlay.py <path/to/xnu>")
     xnu = Path(sys.argv[1]).resolve()
-    print(f"Applying SM-A325M (MT6769T) XNU overlay to {xnu}:")
+    print(f"Applying SM-A325M (MT6769T) XNU overlay (Hito 3+4+5) to {xnu}:")
+    copy_drivers(xnu)
+    patch_build_lists(xnu)
     patch_mtk_ufs(xnu)
     patch_platform_expert(xnu)
     patch_framebuffer(xnu)
