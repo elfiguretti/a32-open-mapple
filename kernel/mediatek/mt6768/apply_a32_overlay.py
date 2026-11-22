@@ -662,7 +662,7 @@ extern "C" void a32_touch_display_power(int on);         /* hid/STMTS.cpp */"""
 
     old_pwr = """\t\t\tIOLog("FB: display %s\\n", off ? "off" : "on");"""
     new_pwr = """\t\t\tIOLog("FB: display %s\\n", off ? "off" : "on");
-\t\t\tif (!off && fPanelHz == 90) {
+\t\t\tif (!off && fFB->fPanelHz == 90) {
 \t\t\t\ta32_dsi_set_fps(90);
 \t\t\t}
 \t\t\ta32_touch_display_power(off ? 0 : 1);"""
