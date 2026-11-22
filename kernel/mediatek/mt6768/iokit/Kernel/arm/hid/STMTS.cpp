@@ -39,6 +39,7 @@
 
 extern "C" int mtk_pwrap_write_regulator(uint32_t addr, uint32_t mask, uint32_t value);
 extern "C" int mapple_gpio_set(uint32_t pin, int high);
+extern "C" int mapple_gpio_get(uint32_t pin, int *high);
 
 #define STM_CMD_SENSE_ON        0x10
 #define STM_CMD_READ_ID         0x22
@@ -65,14 +66,17 @@ extern "C" int mapple_gpio_set(uint32_t pin, int high);
 #define STM_INFO_READY          0x00
 #define STM_READY_RESET         0x10
 
+#define STM_TCHSTA_ENTER        1
 #define STM_TCHSTA_MOVE         2
 #define STM_TCHSTA_LEAVE        3
 
 #define STM_MAX_FINGERS         MAPPLE_TOUCH_FINGERS
 #define STM_MAX_EVENTS_PER_IRQ  32
+#define STM_FIFO_WATCH_MS       80
 
 /* SM-A325M touch power rails (verified from live.dts + mt6358-regulator.c) */
 #define A32_TSP_IO_GPIO         4
+#define A32_TSP_IRQ_GPIO        10
 #define MT6358_VCAMA2_ANA_CON0  0x1e0c
 #define MT6358_LDO_VCAMA2_CON0  0x1c88
 
@@ -85,12 +89,15 @@ public:
 protected:
 	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString("FTS5CU56A"); }
 private:
+	enum class ReadMode { Interrupt, Watch, ConfirmLoss };
 	static void interruptOccurred(OSObject *owner, IOInterruptEventSource *src, int count);
 	static void retryInterrupt(OSObject *owner, IOTimerEventSource *timer);
+	static void watchActiveContacts(OSObject *owner, IOTimerEventSource *timer);
 	void powerOn(void);
 	bool startScanning(void);
-	void readEvents(void);
+	void readEvents(ReadMode mode);
 	void handleEvent(const uint8_t *ev);
+	void releaseContact(uint8_t id);
 	void releaseAll(void);
 	bool sendCmd(const uint8_t *cmd, uint32_t len);
 	IOReturn readCmd(uint8_t cmd, uint8_t *buf, uint32_t len);
@@ -100,13 +107,17 @@ private:
 	IOWorkLoop *fWorkLoop;
 	IOInterruptEventSource *fInterrupt;
 	IOTimerEventSource *fRetryTimer;
+	IOTimerEventSource *fWatchTimer;
 	uint8_t fAddr;
 	uint32_t fMaxX, fMaxY;
 	uint32_t fPanelW, fPanelH;
 	uint32_t fActiveMask;
+	int fLastX[STM_MAX_FINGERS];
+	int fLastY[STM_MAX_FINGERS];
 	uint32_t fErrors;
 	uint32_t fLogCount;
 	bool fSawInterrupt;
+	bool fConfirmLostEvent;
 };
 
 OSDefineMetaClassAndStructors(STMTS, MappleHIDTouch);
@@ -151,6 +162,13 @@ STMTS::readBatch(uint8_t (&events)[STM_MAX_EVENTS_PER_IRQ][STM_EVENT_SIZE], uint
 	count = 1 + (events[0][7] & 0x1fu);
 	if (count > 1) {
 		kr = readCmd(STM_CMD_READ_ALL_EVENT, events[1], (count - 1) * STM_EVENT_SIZE);
+		if (kr == kIOReturnSuccess) {
+			for (uint32_t i = 1; i < count; i++) {
+				if (events[i][0] == 0) {
+					return kIOReturnIOError;
+				}
+			}
+		}
 	}
 	return kr;
 }
@@ -283,9 +301,11 @@ STMTS::start(IOService *provider)
 	}
 	fInterrupt = IOInterruptEventSource::interruptEventSource(this, &STMTS::interruptOccurred, provider, 0);
 	fRetryTimer = IOTimerEventSource::timerEventSource(this, &STMTS::retryInterrupt);
-	if (fInterrupt == NULL || fRetryTimer == NULL ||
+	fWatchTimer = IOTimerEventSource::timerEventSource(this, &STMTS::watchActiveContacts);
+	if (fInterrupt == NULL || fRetryTimer == NULL || fWatchTimer == NULL ||
 	    fWorkLoop->addEventSource(fInterrupt) != kIOReturnSuccess ||
-	    fWorkLoop->addEventSource(fRetryTimer) != kIOReturnSuccess) {
+	    fWorkLoop->addEventSource(fRetryTimer) != kIOReturnSuccess ||
+	    fWorkLoop->addEventSource(fWatchTimer) != kIOReturnSuccess) {
 		IOLog("TOUCH: STMTS failed to attach EINT interrupt\n");
 		return false;
 	}
@@ -308,8 +328,13 @@ STMTS::free(void)
 		fRetryTimer->cancelTimeout();
 		fWorkLoop->removeEventSource(fRetryTimer);
 	}
+	if (fWatchTimer != NULL) {
+		fWatchTimer->cancelTimeout();
+		fWorkLoop->removeEventSource(fWatchTimer);
+	}
 	OSSafeReleaseNULL(fInterrupt);
 	OSSafeReleaseNULL(fRetryTimer);
+	OSSafeReleaseNULL(fWatchTimer);
 	MappleHIDTouch::free();
 	OSSafeReleaseNULL(fWorkLoop);
 }
@@ -322,47 +347,94 @@ STMTS::interruptOccurred(OSObject *owner, IOInterruptEventSource *src __unused, 
 		self->fSawInterrupt = true;
 		IOLog("TOUCH: FTS5CU56A first EINT10 interrupt\n");
 	}
-	self->readEvents();
+	self->readEvents(ReadMode::Interrupt);
 }
 
 void
 STMTS::retryInterrupt(OSObject *owner, IOTimerEventSource *timer __unused)
 {
-	static_cast<STMTS *>(owner)->fInterrupt->enable();
+	STMTS *self = static_cast<STMTS *>(owner);
+	if (self->fConfirmLostEvent) {
+		self->fConfirmLostEvent = false;
+		self->readEvents(ReadMode::ConfirmLoss);
+	}
+	self->fInterrupt->enable();
+}
+
+void
+STMTS::watchActiveContacts(OSObject *owner, IOTimerEventSource *timer)
+{
+	STMTS *self = static_cast<STMTS *>(owner);
+	if (self->fActiveMask == 0) {
+		return;
+	}
+	// A quiet FTS FIFO does not tell us whether a stationary finger is still down.
+	self->readEvents(ReadMode::Watch);
+	if (self->fActiveMask != 0) {
+		timer->setTimeoutMS(STM_FIFO_WATCH_MS);
+	}
+}
+
+void
+STMTS::releaseContact(uint8_t id)
+{
+	fActiveMask &= ~(1u << id);
+	touch(id, false, fLastX[id], fLastY[id]);
 }
 
 void
 STMTS::releaseAll(void)
 {
-	for (int id = 0; id < STM_MAX_FINGERS; id++) {
+	for (uint8_t id = 0; id < STM_MAX_FINGERS; id++) {
 		if (fActiveMask & (1u << id)) {
-			touch(id, false, 0, 0);
+			releaseContact(id);
 		}
 	}
-	fActiveMask = 0;
+	fWatchTimer->cancelTimeout();
 }
 
 void
-STMTS::readEvents(void)
+STMTS::readEvents(ReadMode mode)
 {
+	int irqLevel;
+	bool asserted = mode != ReadMode::ConfirmLoss && fActiveMask != 0 &&
+	    mapple_gpio_get(A32_TSP_IRQ_GPIO, &irqLevel) == 0 && irqLevel == 0;
 	uint8_t events[STM_MAX_EVENTS_PER_IRQ][STM_EVENT_SIZE];
 	uint32_t count;
 	IOReturn kr = readBatch(events, count);
 	if (kr != kIOReturnSuccess || count == 0) {
+		if (mode == ReadMode::Watch && (kr == kIOReturnSuccess || !asserted)) {
+			return;
+		}
 		if (++fErrors <= 8) {
 			IOLog("TOUCH: FTS5CU56A EINT10 %s (0x%x)\n",
 			    kr == kIOReturnSuccess ? "with empty FIFO" : "event read failed", kr);
 		}
-		if (kr != kIOReturnSuccess) {
+		if (mode == ReadMode::ConfirmLoss && fActiveMask != 0) {
+			IOLog("TOUCH: FTS5CU56A missing FIFO record, releasing active contacts\n");
+		}
+		if (kr != kIOReturnSuccess || mode == ReadMode::ConfirmLoss) {
 			releaseAll();
 		}
+		if (mode != ReadMode::Interrupt) {
+			return;
+		}
+		// An already deasserted GPIO can leave a harmless stale IRQ. Only check
+		// for a lost record if the read deasserted an IRQ that signalled data.
+		fConfirmLostEvent = kr == kIOReturnSuccess && asserted &&
+		    mapple_gpio_get(A32_TSP_IRQ_GPIO, &irqLevel) == 0 && irqLevel != 0;
 		// Keep a stuck active-low line from immediately retriggering on an empty or failed read.
 		fInterrupt->disable();
-		fRetryTimer->setTimeoutMS(20);
+		fRetryTimer->setTimeoutMS(fConfirmLostEvent ? 4 : 20);
 		return;
 	}
 	for (uint32_t i = 0; i < count; i++) {
 		handleEvent(events[i]);
+	}
+	if (fActiveMask == 0) {
+		fWatchTimer->cancelTimeout();
+	} else if (mode != ReadMode::Watch) {
+		fWatchTimer->setTimeoutMS(STM_FIFO_WATCH_MS);
 	}
 }
 
@@ -405,8 +477,15 @@ STMTS::handleEvent(const uint8_t *ev)
 		fLogCount++;
 		IOLog("TOUCH: FTS5CU56A %s tid=%u (%d,%d)\n", down ? "down" : "up", tid, x, y);
 	}
+	// A second ENTER on the same slot starts a new contact after a lost LEAVE.
+	if (state == STM_TCHSTA_ENTER && (fActiveMask & (1u << tid))) {
+		IOLog("TOUCH: FTS5CU56A restarting active contact %u\n", tid);
+		releaseContact(tid);
+	}
 	if (down) {
 		fActiveMask |= 1u << tid;
+		fLastX[tid] = x;
+		fLastY[tid] = y;
 	} else {
 		fActiveMask &= ~(1u << tid);
 	}

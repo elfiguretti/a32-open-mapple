@@ -558,7 +558,16 @@ def patch_i2c_dma(xnu: Path):
         'static constexpr uint32_t kA32ApdmaIntFlag = 0x00;\n'
         'static constexpr uint32_t kA32ApdmaEnable = 0x08;\n'
         'static constexpr uint32_t kA32ApdmaRxAddress = 0x20;\n'
-        'static constexpr uint32_t kA32ApdmaDone = 0x03;',
+        'static constexpr uint32_t kA32ApdmaDone = 0x03;\n'
+        '\n'
+        'static bool\n'
+        'a32ApdmaReadDone(vm_offset_t regs, uint32_t rxEnd)\n'
+        '{\n'
+        '\tconst volatile uint32_t *dma = (const volatile uint32_t *)regs;\n'
+        '\treturn dma[kA32ApdmaEnable / 4] == 0 &&\n'
+        '\t       (dma[kA32ApdmaIntFlag / 4] & kA32ApdmaDone) == kA32ApdmaDone &&\n'
+        '\t       dma[kA32ApdmaRxAddress / 4] == rxEnd;\n'
+        '}',
         "MTKIO.cpp: declare ml_io_map for APDMA",
     )
     replace_exact(
@@ -628,6 +637,7 @@ def patch_i2c_dma(xnu: Path):
         "\twr16(I2C_CONTROL, control);",
         "\tbool wrrd = rlen != 0;\n"
         "\tbool useDma = wrrd && rlen > kFIFOSize && fDmaRegs != 0 && fDmaBuf != NULL;\n"
+        "\tuint32_t rxEnd = (uint32_t)(fDmaPa + kA32ApdmaRxOffset + rlen);\n"
         "\n"
         "\twr16(I2C_HW_TIMEOUT, fHWTimeout);\n"
         "\twr16(I2C_CLOCK_DIV, (uint16_t)(((fClockDiv - 1) << 8) | (fClockDiv - 1)));\n"
@@ -666,7 +676,8 @@ def patch_i2c_dma(xnu: Path):
         "\t\t*(volatile uint32_t *)(fDmaRegs + 0x58) = (uint32_t)(rxPa >> 32);\n"
         "\t\t*(volatile uint32_t *)(fDmaRegs + 0x24) = wlen;\n"
         "\t\t*(volatile uint32_t *)(fDmaRegs + 0x28) = rlen;\n"
-        "\t\tOSMemoryBarrier();\n"
+        "\t\t/* Make the write-combined buffer visible to the non-coherent APDMA. */\n"
+        "\t\t__asm__ volatile(\"dsb sy\" ::: \"memory\");\n"
         "\t\t*(volatile uint32_t *)(fDmaRegs + kA32ApdmaEnable) = 1;\n"
         "\t} else {\n"
         "\t\tfor (uint32_t i = 0; i < wlen; i++) {\n"
@@ -702,11 +713,7 @@ def patch_i2c_dma(xnu: Path):
         "\t\t\t\tbreak;\n"
         "\t\t\t}\n"
         "\t\t\t/* On A32, a completed WRRD can leave START and INTR_STAT both zero. */\n"
-        "\t\t\tconst volatile uint32_t *dma = (const volatile uint32_t *)fDmaRegs;\n"
-        "\t\t\tuint32_t rxEnd = (uint32_t)(fDmaPa + kA32ApdmaRxOffset + rlen);\n"
-        "\t\t\tif (rd16(I2C_START) == 0 && dma[kA32ApdmaEnable / 4] == 0 &&\n"
-        "\t\t\t    (dma[kA32ApdmaIntFlag / 4] & kA32ApdmaDone) == kA32ApdmaDone &&\n"
-        "\t\t\t    dma[kA32ApdmaRxAddress / 4] == rxEnd) {\n"
+        "\t\t\tif (rd16(I2C_START) == 0 && a32ApdmaReadDone(fDmaRegs, rxEnd)) {\n"
         "\t\t\t\tfDone = true;\n"
         "\t\t\t\tif (!fReportedDmaPoll) {\n"
         "\t\t\t\t\tfReportedDmaPoll = true;\n"
@@ -727,14 +734,16 @@ def patch_i2c_dma(xnu: Path):
         "\t\trbuf[i] = *(volatile uint8_t *)(fRegs + I2C_DATA_PORT);\n"
         "\t}",
         "\tif (useDma) {\n"
-        "\t\tvolatile uint32_t *dmaEn = (volatile uint32_t *)(fDmaRegs + kA32ApdmaEnable);\n"
-        "\t\tfor (unsigned int i = 0; i < 100 && *dmaEn != 0; i++) {\n"
+        "\t\tfor (unsigned int i = 0; i < 100 && !a32ApdmaReadDone(fDmaRegs, rxEnd); i++) {\n"
         "\t\t\tIODelay(1);\n"
         "\t\t}\n"
-        "\t\tif (*dmaEn != 0) {\n"
-        "\t\t\treturn kIOReturnTimeout;\n"
+        "\t\tif (!a32ApdmaReadDone(fDmaRegs, rxEnd)) {\n"
+        "\t\t\tif (++fErrors <= 8) {\n"
+        "\t\t\t\tIOLog(\"I2C: bus %u short APDMA read (%u bytes requested)\\n\", fBusId, rlen);\n"
+        "\t\t\t}\n"
+        "\t\t\treturn kIOReturnIOError;\n"
         "\t\t}\n"
-        "\t\tOSMemoryBarrier();\n"
+        "\t\t__asm__ volatile(\"dsb sy\" ::: \"memory\");\n"
         "\t\tfor (uint32_t i = 0; i < rlen; i++) {\n"
         "\t\t\trbuf[i] = fDmaBuf[kA32ApdmaRxOffset + i];\n"
         "\t\t}\n"
