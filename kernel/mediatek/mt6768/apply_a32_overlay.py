@@ -1274,11 +1274,1310 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);""",
     )
 
 
+def patch_wifi_mt6768(xnu: Path) -> None:
+    """Port CONNSYS MT6631 Wi-Fi/BT (MTKPwrap.cpp, MT6631WiFi.cpp, mt6631_wifi.c) to MT6768 (soc1_0 / CONNAC1)."""
+    # 1. MTKPwrap.cpp: allow DCXO_CW00 bit 5 (XO_WCN 26 MHz co-clock) and LDO_VCN33_CON0_1 (Wi-Fi VCN33)
+    pwrap = xnu / "iokit/Kernel/arm/MTKPwrap.cpp"
+    replace_exact(
+        pwrap,
+        """\t/* CONNSYS with an MT6631 A-die (consys_hw_vcn33_ctrl, co-clock efuse PALDO VCN28) */
+\t{ 0x1d1c, 0x0003, 0x03 },       /* LDO_VCN33_CON0_0: RG_LDO_VCN33_EN_0, LP */""",
+        """\t/* CONNSYS with an MT6631 A-die (MT6768: DCXO_CW00 XO_WCN + VCN33 BT/Wi-Fi + VCN28) */
+\t{ 0x0788, 0x0020, 0x01 },       /* DCXO_CW00: XO_EXTBUF2_EN_M (WCN 26 MHz co-clock) */
+\t{ 0x1d1c, 0x0003, 0x03 },       /* LDO_VCN33_CON0_0: RG_LDO_VCN33_EN_0, LP (BT) */
+\t{ 0x1d2a, 0x0003, 0x03 },       /* LDO_VCN33_CON0_1: RG_LDO_VCN33_EN_1, LP (Wi-Fi) */""",
+        "MTKPwrap.cpp: whitelist MT6768 DCXO_CW00 (0x788) and VCN33_CON0_1 (0x1d2a)",
+    )
+
+    # 2. MT6631WiFi.cpp: enforce 16 MiB EMI alignment (INFRA_EMI_MAPPING >> 24) and reserve +16 KiB for BTIF TX AP-DMA
+    wcpp = xnu / "iokit/Kernel/arm/MT6631WiFi.cpp"
+    replace_exact(
+        wcpp,
+        """\tif (gMappleWiFiEMI == NULL && PE_parse_boot_argn("mp_wifi_emi", &fixed, sizeof(fixed)) && fixed != 0) {
+\t\tif ((fixed & 0xffff) || !mapple_pa_in_hole(fixed) || !mapple_pa_in_hole(fixed + size - 1)) {
+\t\t\tIOLog("WIFI: mp_wifi_emi 0x%llx refused: not 64 KiB aligned inside one memory hole\\n", fixed);
+\t\t\treturn NULL;
+\t\t}""",
+        """\tif (gMappleWiFiEMI == NULL && PE_parse_boot_argn("mp_wifi_emi", &fixed, sizeof(fixed)) && fixed != 0) {
+\t\tif ((fixed & 0xffffff) || !mapple_pa_in_hole(fixed) || !mapple_pa_in_hole(fixed + size - 1)) {
+\t\t\tIOLog("WIFI: mp_wifi_emi 0x%llx refused: not 16 MiB aligned inside one memory hole\\n", fixed);
+\t\t\treturn NULL;
+\t\t}""",
+        "MT6631WiFi.cpp: require 16 MiB alignment for mp_wifi_emi on MT6768",
+    )
+    replace_exact(
+        wcpp,
+        """\tif (gMappleWiFiEMI == NULL) {
+\t\tstatic const uint64_t masks[] = { 0x00000000ff000000ull, 0x00000000ffff0000ull };
+\t\tfor (unsigned i = 0; i < 2 && gMappleWiFiEMI == NULL; i++) {
+\t\t\tgMappleWiFiEMI = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+\t\t\t    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, masks[i]);
+\t\t}""",
+        """\tif (gMappleWiFiEMI == NULL) {
+\t\t/* MT6768 INFRA_EMI_MAPPING (0x10001380) takes PA >> 24: EMI MUST be 16 MiB aligned */
+\t\tgMappleWiFiEMI = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+\t\t    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000ff000000ull);""",
+        "MT6631WiFi.cpp: strictly 16 MiB aligned EMI window on MT6768",
+    )
+    replace_exact(
+        wcpp,
+        """#define MT6631_WIFI_DMA_SIZE      0x48000""",
+        """#define MT6631_WIFI_DMA_SIZE      0x4c000        /* +16 KiB at 0x48000 for BTIF TX AP-DMA vFIFO */""",
+        "MT6631WiFi.cpp: expand DMA reserve to 0x4c000 for BTIF TX AP-DMA",
+    )
+
+    # 3. bsd/dev/mt6631_wifi.c: full MT6768 (soc1_0 / CONNAC1) adaptation
+    wc = xnu / "bsd/dev/mt6631_wifi.c"
+    replace_exact(
+        wc,
+        """/* AP side */
+#define SPM_POWERON_CONFIG_EN   0x10006000
+#define SPM_CONN_PWR_CON        0x10006304
+#define SPM_PWR_STATUS          0x1000616c
+#define SPM_PWR_STATUS_2ND      0x10006170
+#define CONN_PWR_STA            (1u << 1)
+#define PWR_RST_B               (1u << 0)
+#define PWR_ISO                 (1u << 1)
+#define PWR_ON                  (1u << 2)
+#define PWR_ON_2ND              (1u << 3)
+#define PWR_CLK_DIS             (1u << 4)
+#define INFRA_PROT_SET          0x100012a0
+#define INFRA_PROT_CLR          0x100012a4
+#define INFRA_PROT_STA1         0x10001228
+#define INFRA_PROT1_SET         0x100012a8
+#define INFRA_PROT1_CLR         0x100012ac
+#define INFRA_PROT1_STA1        0x10001258
+#define INFRA_CCIF4_CG_CLR      0x100010c4
+#define INFRA_CONN_CCU_CONFIG   0x10001c14
+#define INFRA_EMI_MAPPING       0x10001380
+#define INFRA_PERI_MAPPING      0x10001388
+#define TOPRGU_SWSYSRST         0x10007018
+#define GPIO_MODE23             0x10005470
+#define GPIO_MODE24             0x10005480
+#define IOCFG_LT_DRV            0x10002c00
+/* CONN side (only with CONN powered and protection released) */
+#define CONN_VERSION            0x180b1010
+#define CONN_CFG_ID             0x180b101c
+#define CONN_HW_VER             0x18002000
+#define CONN_FW_VER             0x18002004
+#define CONN_MCU_COM_REG0       0x18002600
+#define CONN_MCU_EMI_SLPPROT    0x180c1168
+#define CONN_AFE_WBG_PLL_04     0x180b3030
+#define CONN_AFE_WBG_GL5_02     0x180b3104
+#define CONN_XO_1200            0x180c1200
+#define CONN_XO_1204            0x180c1204
+#define CONN_XO_1240            0x180c1240
+#define CONN_ADIE_CTL           0x180c1500
+#define CONN_SPI_STA            0x180c6000
+#define CONN_SPI_ADDR           0x180c6050
+#define CONN_SPI_WDAT           0x180c6054
+#define CONN_SPI_RDAT           0x180c6058
+#define CONN_VERSION_VALUE      0x100b0000""",
+        """/* AP side (MT6768 / SM-A325M) */
+#define SPM_POWERON_CONFIG_EN   0x10006000
+#define SPM_CONN_PWR_CON        0x1000632c
+#define SPM_PWR_STATUS          0x10006180
+#define SPM_PWR_STATUS_2ND      0x10006184
+#define SPM_APSRC_6F8           0x100066f8
+#define SPM_APSRC_6FC           0x100066fc
+#define CONN_PWR_STA            (1u << 1)
+#define PWR_RST_B               (1u << 0)
+#define PWR_ISO                 (1u << 1)
+#define PWR_ON                  (1u << 2)
+#define PWR_ON_2ND              (1u << 3)
+#define PWR_CLK_DIS             (1u << 4)
+#define INFRA_PROT_SET          0x100012a0
+#define INFRA_PROT_CLR          0x100012a4
+#define INFRA_PROT_STA1         0x10001228
+#define INFRA_PROT1_SET         0x100012a8
+#define INFRA_PROT1_CLR         0x100012ac
+#define INFRA_PROT1_STA1        0x10001258
+#define INFRA_EMI_MAPPING       0x10001380
+#define INFRA_PERI_MAPPING      0x10001388
+#define TOPRGU_SWSYSRST         0x10007018
+#define GPIO_MODE23             0x100053e0      /* MT6768 GPIO_MODE14 (A-die interface) */
+#define GPIO_MODE24             0x100053f0      /* MT6768 GPIO_MODE15 (A-die interface) */
+/* CONN side (only with CONN powered and protection released) */
+#define CONN_VERSION            0x180b1010
+#define CONN_CFG_ID             0x180b101c
+#define CONN_HW_VER             0x18002000
+#define CONN_FW_VER             0x18002004
+#define CONN_SW_IRQ_REG         0x18002150      /* bit 21 cleared: EMI control HW mode */
+#define CONN_MCU_COM_REG0       0x18002600
+#define CONN_AFE_WBG_PLL_03     0x180b3034      /* MT6768 RG_WBG_PLL_03: bits 19-20 = 01 */
+#define CONN_XO_1200            0x180c1200
+#define CONN_XO_1204            0x180c1204
+#define CONN_XO_1240            0x180c1240
+#define CONN_ADIE_CTL           0x180c1500
+#define CONN_TOPPOSE_RESTORE    0x180c1600      /* bit 23 set: toppose_restore_done */
+#define CONN_SPI_STA            0x180c6000
+#define CONN_SPI_ADDR           0x180c6050
+#define CONN_SPI_WDAT           0x180c6054
+#define CONN_SPI_RDAT           0x180c6058
+#define CONN_VERSION_VALUE      0x10020501      /* MT6768 Talbot SoC 1.0 */
+#define PMIC_DCXO_CW00          0x0788          /* bit 5: XO_EXTBUF2_EN_M (WCN 26 MHz) */""",
+        "mt6631_wifi.c: MT6768 SPM, pinmux, CONN version, AFE, XO, DCXO register addresses",
+    )
+
+    replace_exact(
+        wc,
+        """\tsay("emi remap 0x%08x, toprgu swsysrst 0x%08x (conn reset bit12 %u), pinmux mode23 0x%08x mode24 0x%08x drv 0x%08x\\n",
+\t    rd(INFRA_EMI_MAPPING), rd(TOPRGU_SWSYSRST), !!(rd(TOPRGU_SWSYSRST) & (1u << 12)), rd(GPIO_MODE23),
+\t    rd(GPIO_MODE24), rd(IOCFG_LT_DRV));""",
+        """\tsay("emi remap 0x%08x, toprgu swsysrst 0x%08x (conn reset bit12 %u), pinmux mode14 0x%08x mode15 0x%08x dcxo_cw00 0x%04x\\n",
+\t    rd(INFRA_EMI_MAPPING), rd(TOPRGU_SWSYSRST), !!(rd(TOPRGU_SWSYSRST) & (1u << 12)), rd(GPIO_MODE23),
+\t    rd(GPIO_MODE24), pmic(PMIC_DCXO_CW00));""",
+        "mt6631_wifi.c: wifi_status show MT6768 pinmux and DCXO_CW00",
+    )
+
+    replace_exact(
+        wc,
+        """\tuint32_t oldM23 = rd(GPIO_MODE23), oldM24 = rd(GPIO_MODE24), oldDrv = rd(IOCFG_LT_DRV);
+\t/* 1. VCN18 (consys_hw_vcn18_ctrl: EN=1 LP=0, SW_OP_EN=1 HW0_OP_EN=1, HW0_OP_CFG=1) */
+\tint e = mtk_pwrap_write_regulator(PMIC_VCN18_CON0, 0x3, 0x1);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN18_OP_EN, 0x3, 0x3);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN18_OP_CFG, 0x2, 0x2);
+\tdelay(300);
+\tsay("detect: vcn18 %s, qi %u\\n", e ? "WRITE FAILED" : "on", !!(pmic(PMIC_VCN18_CON1) & 0x8000));
+\tif (e) {
+\t\tgoto rails;
+\t}
+\t/* 2. A-die interface pins (set_if_pinmux(1)), 150 us */
+\trmw(GPIO_MODE24, 0x77777777, 0x11111111);
+\trmw(GPIO_MODE23, 0x70000000, 0x10000000);
+\trmw(IOCFG_LT_DRV, 0x07ffffff, 0x1209);
+\tdelay(150);
+\t/* 3. CONN CPU held in reset (key 0x88, bit 12), SPM register access */
+\trmw(TOPRGU_SWSYSRST, 0xff001000, 0x88001000);
+\trmw(SPM_POWERON_CONFIG_EN, 0xffff0001, 0x0b160001);
+\t/* 4. MTCMOS on (consys_hw_power_ctrl_mt6781_gen) */
+\twr(INFRA_CCIF4_CG_CLR, 1u << 24);
+\trmw(SPM_CONN_PWR_CON, PWR_ON, PWR_ON);
+\tif (!poll(SPM_PWR_STATUS, CONN_PWR_STA, CONN_PWR_STA, 5000)) {
+\t\tsay("detect: PWR_STATUS did not come up\\n");
+\t\tgoto off;
+\t}
+\trmw(SPM_CONN_PWR_CON, PWR_ON_2ND, PWR_ON_2ND);
+\tif (!poll(SPM_PWR_STATUS_2ND, CONN_PWR_STA, CONN_PWR_STA, 5000)) {
+\t\tsay("detect: PWR_STATUS_2ND did not come up\\n");
+\t\tgoto off;
+\t}
+\trmw(SPM_CONN_PWR_CON, PWR_CLK_DIS, 0);
+\tdelay(1);
+\trmw(SPM_CONN_PWR_CON, PWR_ISO, 0);
+\trmw(SPM_CONN_PWR_CON, PWR_RST_B, PWR_RST_B);
+\tdelay(5000);
+\t/* 5. bus protection off, each acknowledged */
+\t{
+\t\tstatic const struct { uint64_t clr, sta; uint32_t bit; } prot[] = {
+\t\t\t{ INFRA_PROT_CLR, INFRA_PROT_STA1, 0x10000 }, { INFRA_PROT_CLR, INFRA_PROT_STA1, 0x4000 },
+\t\t\t{ INFRA_PROT1_CLR, INFRA_PROT1_STA1, 0x40000 }, { INFRA_PROT_CLR, INFRA_PROT_STA1, 0x2000 },
+\t\t};
+\t\tfor (unsigned i = 0; i < sizeof(prot) / sizeof(prot[0]); i++) {
+\t\t\twr(prot[i].clr, prot[i].bit);
+\t\t\tif (!poll(prot[i].sta, prot[i].bit, 0, 10000)) {
+\t\t\t\tsay("detect: bus protection 0x%x did not release: CONN registers not touched\\n", prot[i].bit);
+\t\t\t\tgoto off;
+\t\t\t}
+\t\t}
+\t}
+\twr(INFRA_CONN_CCU_CONFIG, 0);
+\tdelay(10);
+\t/* 6. chip id (polling_consys_chipid: 10 x 20 ms) */
+\t{
+\t\tbool idOK = false;
+\t\tfor (int i = 0; i < 10 && !(idOK = rd(CONN_VERSION) == CONN_VERSION_VALUE); i++) {
+\t\t\tdelay(20000);
+\t\t}
+\t\tsay("detect: conn version 0x%08x (%s), cfg id %u, hw 0x%04x, fw 0x%04x\\n", rd(CONN_VERSION),
+\t\t    idOK ? "ok" : "UNEXPECTED", rd(CONN_CFG_ID) & 0xf, rd(CONN_HW_VER) & 0xffff, rd(CONN_FW_VER) & 0xffff);
+\t\tif (!idOK) {
+\t\t\tgoto off;
+\t\t}
+\t}
+\t/* 7. EMI HW mode, AFE, XO (legacy co-clock branch: WMT_SOC.cfg co_clock_flag=1) */
+\trmw(CONN_MCU_EMI_SLPPROT, 1u << 0, 1u << 0);
+\twr(CONN_AFE_WBG_PLL_04, 0x00040088);
+\twr(CONN_AFE_WBG_GL5_02, 0xa8808800);
+\trmw(CONN_XO_1240, 1u << 7, 0);
+\trmw(CONN_XO_1204, 0xff00, 0x0600);
+\trmw(CONN_XO_1200, 0xffff, 0x0708);
+\trmw(CONN_XO_1204, 1u << 0, 0);
+\t/* 8. A-die id over the RF SPI (consys_adie_chipid_checking_flow) */
+\trmw(CONN_ADIE_CTL, 1u << 0, 1u << 0);
+\t{
+\t\tuint32_t a = adie_read(0xb024), b = adie_read(0xb02c);
+\t\tsay("detect: a-die spi 0xb024 -> 0x%08x (id 0x%04x), 0xb02c -> 0x%08x (id 0x%04x): %s\\n", a, a >> 16, b, b >> 16,
+\t\t    (a >> 16) == 0x6631 ? "MT6631 (firmware *_soc2_2_*_2_1*)" : (b >> 16) == 0x6635 ?
+\t\t    "MT6635 (firmware *_2a_1*; its 1.3 V rail was off, so this read is lucky)" :
+\t\t    "no answer (MT6635 needs VS2 1.4625 V + GPIO12 on to answer)");
+\t}
+\trmw(CONN_ADIE_CTL, 1u << 0, 0);
+off:
+\to = conn_off(out, len, o);
+\twr(GPIO_MODE24, (rd(GPIO_MODE24) & ~0x77777777u) | (oldM24 & 0x77777777u));
+\twr(GPIO_MODE23, (rd(GPIO_MODE23) & ~0x70000000u) | (oldM23 & 0x70000000u));
+\twr(IOCFG_LT_DRV, (rd(IOCFG_LT_DRV) & ~0x07ffffffu) | (oldDrv & 0x07ffffffu));""",
+        """\tuint32_t oldM23 = rd(GPIO_MODE23), oldM24 = rd(GPIO_MODE24);
+\t/* 1. VCN18 (consys_hw_vcn18_ctrl: EN=1 LP=0, SW_OP_EN=1 HW0_OP_EN=1, HW0_OP_CFG=1) */
+\tint e = mtk_pwrap_write_regulator(PMIC_VCN18_CON0, 0x3, 0x1);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN18_OP_EN, 0x3, 0x3);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN18_OP_CFG, 0x2, 0x2);
+\tdelay(300);
+\tsay("detect: vcn18 %s, qi %u\\n", e ? "WRITE FAILED" : "on", !!(pmic(PMIC_VCN18_CON1) & 0x8000));
+\tif (e) {
+\t\tgoto rails;
+\t}
+\t/* 2. MT6768 A-die interface pins (mt6768.h), 150 us */
+\trmw(GPIO_MODE24, 0x00000077, 0x00000011);
+\trmw(GPIO_MODE23, 0x77777770, 0x11111110);
+\tdelay(150);
+\t/* 3. CONN CPU held in reset (key 0x88, bit 12), SPM register access */
+\trmw(TOPRGU_SWSYSRST, 0xff001000, 0x88001000);
+\trmw(SPM_POWERON_CONFIG_EN, 0xffff0001, 0x0b160001);
+\t/* 4. MT6768 MTCMOS on */
+\trmw(SPM_CONN_PWR_CON, PWR_ON, PWR_ON);
+\tif (!poll(SPM_PWR_STATUS, CONN_PWR_STA, CONN_PWR_STA, 5000)) {
+\t\tsay("detect: PWR_STATUS did not come up\\n");
+\t\tgoto off;
+\t}
+\trmw(SPM_CONN_PWR_CON, PWR_ON_2ND, PWR_ON_2ND);
+\tif (!poll(SPM_PWR_STATUS_2ND, CONN_PWR_STA, CONN_PWR_STA, 5000)) {
+\t\tsay("detect: PWR_STATUS_2ND did not come up\\n");
+\t\tgoto off;
+\t}
+\trmw(SPM_CONN_PWR_CON, PWR_CLK_DIS, 0);
+\tdelay(1);
+\trmw(SPM_CONN_PWR_CON, PWR_ISO, 0);
+\trmw(SPM_CONN_PWR_CON, PWR_RST_B, PWR_RST_B);
+\tdelay(5000);
+\trmw(TOPRGU_SWSYSRST, 0xff000200, 0x88000000); /* ap_sw_rst_b clear */
+\t/* 5. bus protection off, each acknowledged */
+\t{
+\t\tstatic const struct { uint64_t clr, sta; uint32_t bit; } prot[] = {
+\t\t\t{ INFRA_PROT_CLR, INFRA_PROT_STA1, 0x10000 }, { INFRA_PROT_CLR, INFRA_PROT_STA1, 0x4000 },
+\t\t\t{ INFRA_PROT1_CLR, INFRA_PROT1_STA1, 0x40000 }, { INFRA_PROT_CLR, INFRA_PROT_STA1, 0x2000 },
+\t\t};
+\t\tfor (unsigned i = 0; i < sizeof(prot) / sizeof(prot[0]); i++) {
+\t\t\twr(prot[i].clr, prot[i].bit);
+\t\t\tif (!poll(prot[i].sta, prot[i].bit, 0, 10000)) {
+\t\t\t\tsay("detect: bus protection 0x%x did not release: CONN registers not touched\\n", prot[i].bit);
+\t\t\t\tgoto off;
+\t\t\t}
+\t\t}
+\t}
+\tdelay(10);
+\t/* 6. chip id (polling_consys_chipid: 10 x 20 ms) */
+\t{
+\t\tbool idOK = false;
+\t\tfor (int i = 0; i < 10 && !(idOK = rd(CONN_VERSION) == CONN_VERSION_VALUE); i++) {
+\t\t\tdelay(20000);
+\t\t}
+\t\tsay("detect: conn version 0x%08x (%s), cfg id %u, hw 0x%04x, fw 0x%04x\\n", rd(CONN_VERSION),
+\t\t    idOK ? "ok" : "UNEXPECTED", rd(CONN_CFG_ID) & 0xf, rd(CONN_HW_VER) & 0xffff, rd(CONN_FW_VER) & 0xffff);
+\t\tif (!idOK) {
+\t\t\tgoto off;
+\t\t}
+\t}
+\t/* 7. MT6768 EMI HW mode, AFE, XO */
+\trmw(CONN_SW_IRQ_REG, 1u << 21, 0);
+\trmw(CONN_AFE_WBG_PLL_03, 0x00180000, 0x00080000);
+\trmw(CONN_XO_1240, 1u << 7, 0);
+\trmw(CONN_XO_1204, 0xff01, 0x0600);
+\trmw(CONN_XO_1200, 0xffff, 0x0708);
+\t/* 8. A-die id over the RF SPI */
+\trmw(CONN_ADIE_CTL, 1u << 0, 1u << 0);
+\t{
+\t\tuint32_t a = adie_read(0xb024), b = adie_read(0xb02c);
+\t\tsay("detect: a-die spi 0xb024 -> 0x%08x (id 0x%04x), 0xb02c -> 0x%08x (id 0x%04x): %s\\n", a, a >> 16, b, b >> 16,
+\t\t    (a >> 16) == 0x6631 ? "MT6631 (soc1_0_1a_1)" : "unexpected A-die");
+\t}
+\trmw(CONN_ADIE_CTL, 1u << 0, 0);
+off:
+\to = conn_off(out, len, o);
+\twr(GPIO_MODE24, (rd(GPIO_MODE24) & ~0x00000077u) | (oldM24 & 0x00000077u));
+\twr(GPIO_MODE23, (rd(GPIO_MODE23) & ~0x77777770u) | (oldM23 & 0x77777770u));""",
+        "mt6631_wifi.c: MT6768 wifi_detect sequence",
+    )
+
+    replace_exact(
+        wc,
+        """static struct {
+\tbool     on, wmt;
+\tvoid    *emi;
+\tuint64_t emiPA;
+\tuint32_t old18, old18Op, old18Cfg, old33, old33Op, old33Cfg, old28, old28Op, old28Cfg;
+\tuint32_t oldM23, oldM24, oldDrv;
+} vw;""",
+        """static struct {
+\tbool     on, wmt;
+\tvoid    *emi;
+\tuint64_t emiPA;
+\tuint32_t old18, old18Op, old18Cfg, old33, old33_1, old33Op, old33Cfg, old28, old28Op, old28Cfg, oldXo;
+\tuint32_t oldM23, oldM24;
+} vw;""",
+        "mt6631_wifi.c: track VCN33_CON0_1 and DCXO_CW00 in struct vw",
+    )
+
+    replace_exact(
+        wc,
+        """\tif (fw_open("soc2_2_ram_mcu_2_1_hdr.bin", &f) != 0) {""",
+        """\tif (fw_open("soc1_0_ram_mcu_1a_1_hdr.bin", &f) != 0) {""",
+        "mt6631_wifi.c: check soc1_0_ram_mcu_1a_1_hdr.bin in firmware_present",
+    )
+
+    replace_exact(
+        wc,
+        """\tif (err == 0) {
+\t\tmemcpy((char *)vw.emi + dateOff, h.date, 16);
+\t\tmt6631_wifi_emi_flush(off, body);
+\t\tmt6631_wifi_emi_flush(dateOff & ~63u, 64);""",
+        """\tif (err == 0) {
+\t\tuint8_t dt[16];
+\t\tmemcpy(dt, h.date, 15);
+\t\tdt[15] = 0;
+\t\tmemcpy((char *)vw.emi + dateOff, dt, 16);
+\t\tmt6631_wifi_emi_flush(off, body);
+\t\tmt6631_wifi_emi_flush(dateOff & ~63u, 64);""",
+        "mt6631_wifi.c: 15-char NUL-terminated buildtime in EMI (mt6768.c)",
+    )
+
+    replace_exact(
+        wc,
+        """static void
+rails_restore(void)
+{
+\tmtk_pwrap_write_regulator(PMIC_VCN28_CON0, 0x1, vw.old28 & 0x1);
+\tmtk_pwrap_write_regulator(PMIC_VCN28_OP_CFG, 0x2, vw.old28Cfg & 0x2);
+\tmtk_pwrap_write_regulator(PMIC_VCN28_OP_EN, 0x2, vw.old28Op & 0x2);
+\tmtk_pwrap_write_regulator(PMIC_VCN33_OP_CFG, 0x2, vw.old33Cfg & 0x2);
+\tmtk_pwrap_write_regulator(PMIC_VCN33_OP_EN, 0x3, vw.old33Op & 0x3);
+\tmtk_pwrap_write_regulator(PMIC_VCN33_CON0_0, 0x3, vw.old33 & 0x3);
+\tdelay(300);
+\tmtk_pwrap_write_regulator(PMIC_VCN18_OP_CFG, 0x2, vw.old18Cfg & 0x2);
+\tmtk_pwrap_write_regulator(PMIC_VCN18_OP_EN, 0x3, vw.old18Op & 0x3);
+\tmtk_pwrap_write_regulator(PMIC_VCN18_CON0, 0x3, vw.old18 & 0x3);
+}
+
+static void
+pinmux_restore(void)
+{
+\twr(GPIO_MODE24, (rd(GPIO_MODE24) & ~0x77777777u) | (vw.oldM24 & 0x77777777u));
+\twr(GPIO_MODE23, (rd(GPIO_MODE23) & ~0x70000000u) | (vw.oldM23 & 0x70000000u));
+\twr(IOCFG_LT_DRV, (rd(IOCFG_LT_DRV) & ~0x07ffffffu) | (vw.oldDrv & 0x07ffffffu));
+}""",
+        """static void
+rails_restore(void)
+{
+\tmtk_pwrap_write_regulator(PMIC_DCXO_CW00, 0x20, vw.oldXo & 0x20);
+\tmtk_pwrap_write_regulator(PMIC_VCN28_CON0, 0x1, vw.old28 & 0x1);
+\tmtk_pwrap_write_regulator(PMIC_VCN28_OP_CFG, 0x2, vw.old28Cfg & 0x2);
+\tmtk_pwrap_write_regulator(PMIC_VCN28_OP_EN, 0x2, vw.old28Op & 0x2);
+\tmtk_pwrap_write_regulator(PMIC_VCN33_OP_CFG, 0x2, vw.old33Cfg & 0x2);
+\tmtk_pwrap_write_regulator(PMIC_VCN33_OP_EN, 0x3, vw.old33Op & 0x3);
+\tmtk_pwrap_write_regulator(PMIC_VCN33_CON0_1, 0x3, vw.old33_1 & 0x3);
+\tmtk_pwrap_write_regulator(PMIC_VCN33_CON0_0, 0x3, vw.old33 & 0x3);
+\tdelay(300);
+\tmtk_pwrap_write_regulator(PMIC_VCN18_OP_CFG, 0x2, vw.old18Cfg & 0x2);
+\tmtk_pwrap_write_regulator(PMIC_VCN18_OP_EN, 0x3, vw.old18Op & 0x3);
+\tmtk_pwrap_write_regulator(PMIC_VCN18_CON0, 0x3, vw.old18 & 0x3);
+}
+
+static void
+pinmux_restore(void)
+{
+\twr(GPIO_MODE24, (rd(GPIO_MODE24) & ~0x00000077u) | (vw.oldM24 & 0x00000077u));
+\twr(GPIO_MODE23, (rd(GPIO_MODE23) & ~0x77777770u) | (vw.oldM23 & 0x77777770u));
+}""",
+        "mt6631_wifi.c: MT6768 rails_restore and pinmux_restore",
+    )
+
+    replace_exact(
+        wc,
+        """\tbzero(vw.emi, EMI_SIZE);
+\tmt6631_wifi_emi_flush(0, EMI_SIZE);
+\tsay("on: EMI window PA 0x%llx (%s aligned), MCU sees it at 0x%08x\\n", vw.emiPA,
+\t    (vw.emiPA & 0xffffff) == 0 ? "16 MiB" : "64 KiB", EMI_CONN_BASE);
+\tif (load_patch("soc2_2_ram_mcu_2_1_hdr.bin", 0x000000, 0x88320, out, len, &o) ||
+\t    load_patch("soc2_2_ram_bt_2_1_hdr.bin", 0x170000, 0x88300, out, len, &o) ||
+\t    load_patch("soc2_2_ram_wifi_2_1_hdr.bin", 0x2a0000, 0x88310, out, len, &o)) {
+\t\treturn o;
+\t}
+\trmw(INFRA_EMI_MAPPING, 0xfffff, (uint32_t)(vw.emiPA >> 16));
+\trmw(INFRA_PERI_MAPPING, 0xfffff, 0x1000);
+\t/* rails: VCN18, then VCN33 at 3.3 V (6631), VCN28 on in co-clock mode (efuse PALDO, HW mode off) */
+\tvw.old18 = pmic(PMIC_VCN18_CON0);
+\tvw.old18Op = pmic(PMIC_VCN18_OP_EN);
+\tvw.old18Cfg = pmic(PMIC_VCN18_OP_CFG);
+\tvw.old33 = pmic(PMIC_VCN33_CON0_0);
+\tvw.old33Op = pmic(PMIC_VCN33_OP_EN);
+\tvw.old33Cfg = pmic(PMIC_VCN33_OP_CFG);
+\tvw.old28 = pmic(PMIC_VCN28_CON0);
+\tvw.old28Op = pmic(PMIC_VCN28_OP_EN);
+\tvw.old28Cfg = pmic(PMIC_VCN28_OP_CFG);
+\tvw.oldM23 = rd(GPIO_MODE23);
+\tvw.oldM24 = rd(GPIO_MODE24);
+\tvw.oldDrv = rd(IOCFG_LT_DRV);
+\tint e = mtk_pwrap_write_regulator(PMIC_VCN18_CON0, 0x3, 0x1);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN18_OP_EN, 0x3, 0x3);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN18_OP_CFG, 0x2, 0x2);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN33_ANA, 0x300, 0x100);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN33_CON0_0, 0x3, 0x1);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN33_OP_EN, 0x3, 0x3);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN33_OP_CFG, 0x2, 0x2);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN28_OP_EN, 0x2, 0x0);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN28_OP_CFG, 0x2, 0x0);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN28_CON0, 0x1, 0x1);
+\tdelay(300);
+\tsay("on: rails %s: vcn18 qi %u, vcn33 qi %u (ana %04x), vcn28 qi %u\\n", e ? "WRITE FAILED" : "on",
+\t    !!(pmic(PMIC_VCN18_CON1) & 0x8000), !!(pmic(PMIC_VCN33_CON1) & 0x8000), pmic(PMIC_VCN33_ANA),
+\t    !!(pmic(PMIC_VCN28_CON1) & 0x8000));
+\tvw.on = true;           /* from here "wifi off" undoes everything */
+\tif (e) {
+\t\tgoto fail;
+\t}
+\trmw(GPIO_MODE24, 0x77777777, 0x11111111);
+\trmw(GPIO_MODE23, 0x70000000, 0x10000000);
+\trmw(IOCFG_LT_DRV, 0x07ffffff, 0x1209);
+\tdelay(150);
+\trmw(TOPRGU_SWSYSRST, 0xff001000, 0x88001000);
+\trmw(SPM_POWERON_CONFIG_EN, 0xffff0001, 0x0b160001);
+\twr(INFRA_CCIF4_CG_CLR, 1u << 24);
+\trmw(SPM_CONN_PWR_CON, PWR_ON, PWR_ON);
+\tif (!poll(SPM_PWR_STATUS, CONN_PWR_STA, CONN_PWR_STA, 5000)) {
+\t\tsay("on: PWR_STATUS did not come up\\n");
+\t\tgoto fail;
+\t}
+\trmw(SPM_CONN_PWR_CON, PWR_ON_2ND, PWR_ON_2ND);
+\tif (!poll(SPM_PWR_STATUS_2ND, CONN_PWR_STA, CONN_PWR_STA, 5000)) {
+\t\tsay("on: PWR_STATUS_2ND did not come up\\n");
+\t\tgoto fail;
+\t}
+\trmw(SPM_CONN_PWR_CON, PWR_CLK_DIS, 0);
+\tdelay(1);
+\trmw(SPM_CONN_PWR_CON, PWR_ISO, 0);
+\trmw(SPM_CONN_PWR_CON, PWR_RST_B, PWR_RST_B);
+\tdelay(5000);
+\t{
+\t\tstatic const struct { uint64_t clr, sta; uint32_t bit; } prot[] = {
+\t\t\t{ INFRA_PROT_CLR, INFRA_PROT_STA1, 0x10000 }, { INFRA_PROT_CLR, INFRA_PROT_STA1, 0x4000 },
+\t\t\t{ INFRA_PROT1_CLR, INFRA_PROT1_STA1, 0x40000 }, { INFRA_PROT_CLR, INFRA_PROT_STA1, 0x2000 },
+\t\t};
+\t\tfor (unsigned i = 0; i < sizeof(prot) / sizeof(prot[0]); i++) {
+\t\t\twr(prot[i].clr, prot[i].bit);
+\t\t\tif (!poll(prot[i].sta, prot[i].bit, 0, 10000)) {
+\t\t\t\tsay("on: bus protection 0x%x did not release\\n", prot[i].bit);
+\t\t\t\tgoto fail;
+\t\t\t}
+\t\t}
+\t}
+\twr(INFRA_CONN_CCU_CONFIG, 0);
+\tdelay(10);
+\t{
+\t\tbool idOK = false;
+\t\tfor (int i = 0; i < 10 && !(idOK = rd(CONN_VERSION) == CONN_VERSION_VALUE); i++) {
+\t\t\tdelay(20000);
+\t\t}
+\t\tif (!idOK) {
+\t\t\tsay("on: conn version 0x%08x, not 0x%08x\\n", rd(CONN_VERSION), CONN_VERSION_VALUE);
+\t\t\tgoto fail;
+\t\t}
+\t}
+\trmw(CONN_MCU_EMI_SLPPROT, 1u << 0, 1u << 0);           /* 11. EMI HW mode */
+\twr(CONN_AFE_WBG_PLL_04, 0x00040088);                    /* 13. AFE */
+\twr(CONN_AFE_WBG_GL5_02, 0xa8808800);
+\twr(CONN_BT_EMI_ENTRY, EMI_CONN_BASE + 0x170000);        /* 14. EMI entries */
+\twr(CONN_WF_EMI_ENTRY, EMI_CONN_BASE + 0x2a0000);
+\trmw(CONN_XO_1240, 1u << 7, 0);                          /* 15. XO, legacy co-clock */
+\trmw(CONN_XO_1204, 0xff00, 0x0600);
+\trmw(CONN_XO_1200, 0xffff, 0x0708);
+\trmw(CONN_XO_1204, 1u << 0, 0);
+\trmw(CONN_ADIE_SEL, 0x300, 0x100);                       /* 16. A-die = MT6631 */
+\twr(CONN_BUSHANGCR, 0x90000002);                         /* 18. bus timeout */
+\trmw(CONN_RGU_DLY_CHAIN, 0xf0000, 0x40000);              /* 19. MCU mem PDN delay */
+\trmw(TOPRGU_SWSYSRST, 0xff001000, 0x88000000);           /* 20. CPU out of reset: ROM, then the patches */
+\t{
+\t\tbool idle = false;
+\t\tuint32_t t;
+\t\tfor (t = 0; t < 41 && !(idle = rd(CONN_MCU_COM_REG0) == CONN_IDLE_MAGIC); t++) {
+\t\t\tdelay(6000);
+\t\t}
+\t\tsay("on: MCU %s after ~%u ms: com_reg0 0x%08x, pc 0x%08x, dbg 0x%08x\\n", idle ? "IDLE LOOP" :
+\t\t    "NOT IDLE", t * 6, rd(CONN_MCU_COM_REG0), rd(CONN_MCU_PC), rd(CONN_MCU_DBG_216C));
+\t\tif (!idle) {
+\t\t\tsay("on: left on for inspection (wifi status, peek); wifi off to power down. Next suspects: EMI MPU "
+\t\t\t    "SMC, patch placement\\n");
+\t\t}
+\t}""",
+        """\tif ((vw.emiPA & 0xffffff) != 0) {
+\t\tsay("on: EMI window PA 0x%llx is NOT 16 MiB aligned (required by MT6768 INFRA_EMI_MAPPING)\\n", vw.emiPA);
+\t\treturn o;
+\t}
+\tbzero(vw.emi, EMI_SIZE);
+\t/* Dedicated FW log ring header at EMI +0x36500 (mt6768.c: MCU 16K, Wi-Fi 64K, BT 64K, GPS 32K + "EMIFWLOG") */
+\t{
+\t\tstatic const uint32_t loghdr[8] = {
+\t\t\t0x40, 16 * 1024,
+\t\t\t0x40 + 16 * 1024 + 64, 64 * 1024,
+\t\t\t0x40 + 16 * 1024 + 64 + 64 * 1024 + 64, 64 * 1024,
+\t\t\t0x40 + 16 * 1024 + 64 + 2 * (64 * 1024 + 64), 32 * 1024,
+\t\t};
+\t\tuint8_t *lp = (uint8_t *)vw.emi + 0x36500;
+\t\tmemcpy(lp, loghdr, sizeof(loghdr));
+\t\tmemcpy(lp + 56, "EMIFWLOG", 8);
+\t}
+\tmt6631_wifi_emi_flush(0, EMI_SIZE);
+\tsay("on: EMI window PA 0x%llx (16 MiB aligned), MCU sees it at 0x%08x\\n", vw.emiPA, EMI_CONN_BASE);
+\tif (load_patch("soc1_0_ram_mcu_1a_1_hdr.bin", 0x000000, 0x68320, out, len, &o) ||
+\t    load_patch("soc1_0_ram_bt_1a_1_hdr.bin", 0x080000, 0x68300, out, len, &o) ||
+\t    load_patch("soc1_0_ram_wifi_1a_1_hdr.bin", 0x140000, 0x68310, out, len, &o)) {
+\t\treturn o;
+\t}
+\trmw(INFRA_EMI_MAPPING, 0xfff, (uint32_t)((vw.emiPA >> 24) & 0xfff));
+\trmw(INFRA_PERI_MAPPING, 0x0fff0000, ((0x10003000u >> 24) & 0xfff) << 16);
+\t/* rails: VCN18, VCN33 at 3.3 V (both BT EN0 and Wi-Fi EN1), VCN28, and DCXO_CW00 XO_WCN 26 MHz co-clock */
+\tvw.old18 = pmic(PMIC_VCN18_CON0);
+\tvw.old18Op = pmic(PMIC_VCN18_OP_EN);
+\tvw.old18Cfg = pmic(PMIC_VCN18_OP_CFG);
+\tvw.old33 = pmic(PMIC_VCN33_CON0_0);
+\tvw.old33_1 = pmic(PMIC_VCN33_CON0_1);
+\tvw.old33Op = pmic(PMIC_VCN33_OP_EN);
+\tvw.old33Cfg = pmic(PMIC_VCN33_OP_CFG);
+\tvw.old28 = pmic(PMIC_VCN28_CON0);
+\tvw.old28Op = pmic(PMIC_VCN28_OP_EN);
+\tvw.old28Cfg = pmic(PMIC_VCN28_OP_CFG);
+\tvw.oldXo = pmic(PMIC_DCXO_CW00);
+\tvw.oldM23 = rd(GPIO_MODE23);
+\tvw.oldM24 = rd(GPIO_MODE24);
+\tint e = mtk_pwrap_write_regulator(PMIC_VCN18_OP_EN, 0x3, 0x1);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN18_CON0, 0x3, 0x1);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN33_OP_EN, 0x3, 0x1);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN33_ANA, 0x300, 0x100);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN33_CON0_0, 0x3, 0x1);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN33_CON0_1, 0x3, 0x1);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN28_OP_EN, 0x2, 0x0);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN28_OP_CFG, 0x2, 0x0);
+\te |= mtk_pwrap_write_regulator(PMIC_VCN28_CON0, 0x1, 0x1);
+\te |= mtk_pwrap_write_regulator(PMIC_DCXO_CW00, 0x20, 0x20);
+\tdelay(2000);
+\tsay("on: rails %s: vcn18 qi %u, vcn33 qi %u (ana %04x), vcn28 qi %u, dcxo_cw00 %04x->%04x\\n",
+\t    e ? "WRITE FAILED" : "on", !!(pmic(PMIC_VCN18_CON1) & 0x8000), !!(pmic(PMIC_VCN33_CON1) & 0x8000),
+\t    pmic(PMIC_VCN33_ANA), !!(pmic(PMIC_VCN28_CON1) & 0x8000), vw.oldXo, pmic(PMIC_DCXO_CW00));
+\tvw.on = true;           /* from here "wifi off" undoes everything */
+\tif (e) {
+\t\tgoto fail;
+\t}
+\trmw(GPIO_MODE24, 0x00000077, 0x00000011);
+\trmw(GPIO_MODE23, 0x77777770, 0x11111110);
+\tdelay(150);
+\trmw(TOPRGU_SWSYSRST, 0xff001000, 0x88001000);
+\trmw(SPM_POWERON_CONFIG_EN, 0xffff0001, 0x0b160001);
+\trmw(SPM_CONN_PWR_CON, PWR_ON, PWR_ON);
+\tif (!poll(SPM_PWR_STATUS, CONN_PWR_STA, CONN_PWR_STA, 10000)) {
+\t\tsay("on: PWR_STATUS did not come up\\n");
+\t\tgoto fail;
+\t}
+\trmw(SPM_CONN_PWR_CON, PWR_ON_2ND, PWR_ON_2ND);
+\tif (!poll(SPM_PWR_STATUS_2ND, CONN_PWR_STA, CONN_PWR_STA, 10000)) {
+\t\tsay("on: PWR_STATUS_2ND did not come up\\n");
+\t\tgoto fail;
+\t}
+\trmw(SPM_CONN_PWR_CON, PWR_CLK_DIS, 0);
+\tdelay(1);
+\trmw(SPM_CONN_PWR_CON, PWR_ISO, 0);
+\trmw(SPM_CONN_PWR_CON, PWR_RST_B, PWR_RST_B);
+\tdelay(5000);
+\trmw(TOPRGU_SWSYSRST, 0xff000200, 0x88000000);           /* ap_sw_rst_b let go */
+\t{
+\t\tstatic const struct { uint64_t clr, sta; uint32_t bit; } prot[] = {
+\t\t\t{ INFRA_PROT_CLR, INFRA_PROT_STA1, 0x10000 }, { INFRA_PROT_CLR, INFRA_PROT_STA1, 0x4000 },
+\t\t\t{ INFRA_PROT1_CLR, INFRA_PROT1_STA1, 0x40000 }, { INFRA_PROT_CLR, INFRA_PROT_STA1, 0x2000 },
+\t\t};
+\t\tfor (unsigned i = 0; i < sizeof(prot) / sizeof(prot[0]); i++) {
+\t\t\twr(prot[i].clr, prot[i].bit);
+\t\t\tif (!poll(prot[i].sta, prot[i].bit, 0, 10000)) {
+\t\t\t\tsay("on: bus protection 0x%x did not release\\n", prot[i].bit);
+\t\t\t\tgoto fail;
+\t\t\t}
+\t\t}
+\t}
+\twr(SPM_APSRC_6F8, 0x5);
+\twr(SPM_APSRC_6FC, 0x50505);
+\tdelay(10);
+\t{
+\t\tbool idOK = false;
+\t\tfor (int i = 0; i < 10 && !(idOK = rd(CONN_VERSION) == CONN_VERSION_VALUE); i++) {
+\t\t\tdelay(20000);
+\t\t}
+\t\tif (!idOK) {
+\t\t\tsay("on: conn version 0x%08x, not 0x%08x\\n", rd(CONN_VERSION), CONN_VERSION_VALUE);
+\t\t\tgoto fail;
+\t\t}
+\t}
+\t/* MT6768 post-chipid setup (mt6768.c): AFE, XO co-clock, EMI HW mode, toppose restore */
+\trmw(CONN_AFE_WBG_PLL_03, 0x00180000, 0x00080000);
+\trmw(CONN_XO_1200, 0xffff, 0x0708);
+\trmw(CONN_XO_1204, 0xff01, 0x0600);
+\trmw(CONN_SW_IRQ_REG, 1u << 21, 0);
+\trmw(CONN_TOPPOSE_RESTORE, 1u << 23, 1u << 23);
+\twr(CONN_BUSHANGCR, 0x90000002);
+\trmw(TOPRGU_SWSYSRST, 0xff001000, 0x88000000);           /* CPU out of reset */
+\t{
+\t\tbool idle = false;
+\t\tuint32_t t;
+\t\tfor (t = 0; t < 50 && !(idle = rd(CONN_MCU_COM_REG0) == CONN_IDLE_MAGIC); t++) {
+\t\t\tdelay(10000);
+\t\t}
+\t\tfor (uint32_t k = 0; idle && k < 100 && rd(CONN_MCU_PC) != 0xb04; k++) {
+\t\t\tdelay(10000);
+\t\t}
+\t\tsay("on: MCU %s after ~%u ms: com_reg0 0x%08x, pc 0x%08x, dbg 0x%08x\\n", idle ? "IDLE LOOP" :
+\t\t    "NOT IDLE", t * 10, rd(CONN_MCU_COM_REG0), rd(CONN_MCU_PC), rd(CONN_MCU_DBG_216C));
+\t\tif (!idle) {
+\t\t\tsay("on: left on for inspection (wifi status, peek); wifi off to power down.\\n");
+\t\t}
+\t}""",
+        "mt6631_wifi.c: MT6768 wifi_on (log ring, soc1_0 patches, >>24 EMI remap, DCXO_CW00, AFE, toppose)",
+    )
+
+    # BTIF TX AP-DMA + soc1_0_patch_mcu PDA download + MT6768 WMT init script
+    replace_exact(
+        wc,
+        """#define INFRA_CG0_CLR           0x10001084
+#define INFRA_CG0_STA           0x10001090
+#define INFRA_CG0_BTIF          (1u << 31)
+#define STP_TYPE_WMT            4
+#define STP_TYPE_BT             0
+
+static struct {
+\tbool    full;
+\tuint8_t txseq, txack, rxseq;
+\tuint16_t crc[256];
+} st;""",
+        """#define INFRA_CG0_CLR           0x10001084
+#define INFRA_CG0_STA           0x10001090
+#define INFRA_CG0_BTIF          (1u << 31)
+#define INFRA_CG1_CLR           0x1000108c
+#define INFRA_CG1_APDMA         (1u << 18)
+#define BTIF_TX_DMA_BASE        0x11000b80
+#define OFF_BTIF_TX             0x48000u
+#define BTIF_TX_VFF_SZ          8192u
+#define LSR_TEMT                (1u << 6)
+#define STP_TYPE_WMT            4
+#define STP_TYPE_BT             0
+
+static struct {
+\tbool     full, dmaOn;
+\tuint8_t  txseq, txack, rxseq;
+\tuint16_t crc[256];
+\tuint8_t *vff;
+\tuint32_t vffPA, wpt, wrap;
+} st;""",
+        "mt6631_wifi.c: BTIF TX AP-DMA defines and state",
+    )
+
+    replace_exact(
+        wc,
+        """static bool
+btif_put(const uint8_t *b, uint32_t n)
+{
+\tfor (uint32_t i = 0; i < n; i++) {
+\t\tif (!poll(BTIF_LSR, LSR_THRE, LSR_THRE, 20000)) {
+\t\t\treturn false;
+\t\t}
+\t\twr(BTIF_THR, b[i]);
+\t}
+\treturn true;
+}""",
+        """static void
+btif_dma_init(void)
+{
+\tuint64_t pa = 0;
+\t(void)mt6631_wifi_dma_alloc(0x4c000, &pa);
+\tuint8_t *uva = mt6631_wifi_dma_uncached();
+\tst.dmaOn = false;
+\tif (pa == 0 || uva == NULL) {
+\t\treturn;
+\t}
+\tst.vff = uva + OFF_BTIF_TX;
+\tst.vffPA = (uint32_t)(pa + OFF_BTIF_TX);
+\twr(INFRA_CG1_CLR, INFRA_CG1_APDMA);
+\tdelay(10);
+\trmw(BTIF_TX_DMA_BASE + 0x0c, 1u, 1u);
+\t(void)poll(BTIF_TX_DMA_BASE + 0x08, 1u, 0, 2000);
+\tif (rd(BTIF_TX_DMA_BASE + 0x08) & 1u) {
+\t\trmw(BTIF_TX_DMA_BASE + 0x0c, 2u, 2u);
+\t\tdelay(10);
+\t\trmw(BTIF_TX_DMA_BASE + 0x0c, 2u, 0);
+\t}
+\twr(BTIF_TX_DMA_BASE + 0x1c, st.vffPA);
+\twr(BTIF_TX_DMA_BASE + 0x54, (uint32_t)((pa + OFF_BTIF_TX) >> 32));
+\twr(BTIF_TX_DMA_BASE + 0x24, BTIF_TX_VFF_SZ);
+\twr(BTIF_TX_DMA_BASE + 0x2c, 0);
+\twr(BTIF_TX_DMA_BASE + 0x30, 0);
+\tst.wpt = 0;
+\tst.wrap = 0;
+\twr(BTIF_TX_DMA_BASE + 0x28, BTIF_TX_VFF_SZ - 7);
+\twr(BTIF_TX_DMA_BASE + 0x00, 0);
+\twr(BTIF_TX_DMA_BASE + 0x04, 0);
+\tst.dmaOn = true;
+}
+
+static bool
+btif_put(const uint8_t *b, uint32_t n)
+{
+\tif (st.dmaOn) {
+\t\t(void)poll(BTIF_TX_DMA_BASE + 0x14, 1u, 0, 500000);
+\t\tuint32_t at = 0;
+\t\twhile (at < n) {
+\t\t\tuint32_t left = rd(BTIF_TX_DMA_BASE + 0x40);
+\t\t\tif (left == 0) {
+\t\t\t\tfor (uint32_t t = 0; t < 50000 && (left = rd(BTIF_TX_DMA_BASE + 0x40)) == 0; t++) {
+\t\t\t\t\tdelay(10);
+\t\t\t\t}
+\t\t\t\tif (left == 0) {
+\t\t\t\t\treturn false;
+\t\t\t\t}
+\t\t\t}
+\t\t\tuint32_t chunk = MIN(n - at, left);
+\t\t\tvolatile uint8_t *dst = st.vff;
+\t\t\tif (st.wpt + chunk >= BTIF_TX_VFF_SZ) {
+\t\t\t\tuint32_t tail = BTIF_TX_VFF_SZ - st.wpt;
+\t\t\t\tfor (uint32_t i = 0; i < tail; i++) dst[st.wpt + i] = b[at + i];
+\t\t\t\tfor (uint32_t i = 0; i < chunk - tail; i++) dst[i] = b[at + tail + i];
+\t\t\t\tst.wpt = st.wpt + chunk - BTIF_TX_VFF_SZ;
+\t\t\t\tst.wrap ^= 0x10000u;
+\t\t\t} else {
+\t\t\t\tfor (uint32_t i = 0; i < chunk; i++) dst[st.wpt + i] = b[at + i];
+\t\t\t\tst.wpt += chunk;
+\t\t\t}
+\t\t\tat += chunk;
+\t\t\t__builtin_arm_dsb(0xf);
+\t\t\trmw(BTIF_TX_DMA_BASE + 0x08, 1u, 1u);
+\t\t\twr(BTIF_TX_DMA_BASE + 0x2c, st.wpt | st.wrap);
+\t\t\tuint32_t valid = rd(BTIF_TX_DMA_BASE + 0x3c);
+\t\t\tif (valid > 0 && valid < 8) {
+\t\t\t\trmw(BTIF_TX_DMA_BASE + 0x14, 1u, 1u);
+\t\t\t}
+\t\t}
+\t\tfor (uint32_t t = 0; t < 50000 && rd(BTIF_TX_DMA_BASE + 0x3c) != 0; t++) {
+\t\t\tuint32_t valid = rd(BTIF_TX_DMA_BASE + 0x3c);
+\t\t\tif (valid > 0 && valid < 8) {
+\t\t\t\trmw(BTIF_TX_DMA_BASE + 0x14, 1u, 1u);
+\t\t\t}
+\t\t\tdelay(10);
+\t\t}
+\t\treturn poll(BTIF_LSR, LSR_TEMT, LSR_TEMT, 500000);
+\t}
+\tfor (uint32_t i = 0; i < n; i++) {
+\t\tif (!poll(BTIF_LSR, LSR_THRE, LSR_THRE, 20000)) {
+\t\t\treturn false;
+\t\t}
+\t\twr(BTIF_THR, b[i]);
+\t}
+\treturn true;
+}""",
+        "mt6631_wifi.c: BTIF TX AP-DMA channel 0x11000b80 implementation",
+    )
+
+    replace_exact(
+        wc,
+        """\twr(BTIF_TRI_LVL, 8 | (1u << 4));                /* TX 8, RX 1, loopback off */
+\twr(BTIF_DMA_EN, 1u << 2);                       /* PIO both ways, auto reset */
+\twr(BTIF_IER, 0);                                /* polled */
+\tbtif_wake();""",
+        """\twr(BTIF_TRI_LVL, 8 | (1u << 4));                /* TX 8, RX 1, loopback off */
+\tbtif_dma_init();
+\twr(BTIF_DMA_EN, st.dmaOn ? ((1u << 2) | (1u << 1)) : (1u << 2));
+\twr(BTIF_IER, 0);                                /* polled */
+\tbtif_wake();
+\tdelay(20000);""",
+        "mt6631_wifi.c: enable BTIF TX AP-DMA and 20 ms post-wake delay in btif_init",
+    )
+
+    replace_exact(
+        wc,
+        """\t\tdo {                                    /* sync: bit 7 */
+\t\t\tb0 = btif_get(ms * 1000);
+\t\t} while (b0 >= 0 && !(b0 & 0x80));""",
+        """\t\tdo {                                    /* sync: bit 7 set, bit 6 clear */
+\t\t\tb0 = btif_get(ms * 1000);
+\t\t} while (b0 >= 0 && (b0 == 0x55 || !(b0 & 0x80) || (b0 & 0x40)));""",
+        "mt6631_wifi.c: skip 0x55/bit6 noise in stp_recv",
+    )
+
+    replace_exact(
+        wc,
+        """\tfor (int k = 0; k < 4; k++) {
+\t\tn = stp_recv(ev, evmax, ms, &type);""",
+        """\tfor (int k = 0; k < 12; k++) {
+\t\tn = stp_recv(ev, evmax, ms, &type);""",
+        "mt6631_wifi.c: tolerate extra WMT power-saving events in wmt_cmd",
+    )
+
+    replace_exact(
+        wc,
+        """\tif (rn >= 16) {
+\t\tsay("wmt: GEN_HCR 0x%02x%02x%02x%02x (the MCU answers over STP/BTIF)\\n", ev[15], ev[14], ev[13], ev[12]);
+\t}
+\tstatic const uint8_t qstp[] = { 0x01, 0x04, 0x01, 0x00, 0x04 };
+\tstatic const uint8_t qstpDef[] = { 0x02, 0x04, 0x06, 0x00, 0x00, 0x04, 0x11, 0x00, 0x00, 0x00 };
+\tstatic const uint8_t qstpFull[] = { 0x02, 0x04, 0x06, 0x00, 0x00, 0x04, 0xdb, 0x0e, 0x68, 0x01 };
+\tstatic const uint8_t sstp[] = { 0x01, 0x04, 0x05, 0x00, 0x03, 0xdb, 0x0e, 0x68, 0x01 };
+\tstatic const uint8_t sstpEv[] = { 0x02, 0x04, 0x02, 0x00, 0x00, 0x03 };
+\t(void)wmt_cmd("query stp", qstp, sizeof(qstp), qstpDef, sizeof(qstpDef), 1000, ev, sizeof(ev), out, len, &o);
+\tif (wmt_cmd("set stp full", sstp, sizeof(sstp), sstpEv, sizeof(sstpEv), 1000, ev, sizeof(ev), out, len, &o) < 0) {
+\t\treturn o;
+\t}
+\tst.full = true;                                 /* host side switch, 10 ms */
+\tst.txseq = 0;
+\tst.txack = 7;
+\tdelay(10000);
+\tif (wmt_cmd("query stp (full)", qstp, sizeof(qstp), qstpFull, sizeof(qstpFull), 1000, ev, sizeof(ev), out, len,
+\t    &o) < 0) {
+\t\treturn o;
+\t}
+\tstatic const uint8_t chipid[] = { 0x01, 0x02, 0x05, 0x00, 0x11, 0x81, 0x67, 0x00, 0x00 };
+\tstatic const uint8_t chipidEv[] = { 0x02, 0x02, 0x01, 0x00, 0x00 };
+\tif (wmt_cmd("set chip id 0x6781", chipid, sizeof(chipid), chipidEv, sizeof(chipidEv), 1000, ev, sizeof(ev), out,
+\t    len, &o) < 0) {
+\t\treturn o;
+\t}
+\tstatic const uint8_t adie[] = { 0x01, 0x02, 0x01, 0x00, 0x12 };
+\tstatic const uint8_t adieEv[] = { 0x02, 0x02, 0x05, 0x00, 0x00 };
+\t(void)wmt_cmd("query a-die", adie, sizeof(adie), adieEv, sizeof(adieEv), 1000, ev, sizeof(ev), out, len, &o);
+\tstatic const uint8_t cal[] = { 0x01, 0x14, 0x01, 0x00, 0x01 };
+\t/* MT6781: 02 14 <len 0x22a> 00 01 + calibration data (0130 on the phone) */
+\tstatic const uint8_t calEv[] = { 0x02, 0x14 };
+\tint c = wmt_cmd("rf calibration", cal, sizeof(cal), calEv, sizeof(calEv), 5000, ev, sizeof(ev), out, len, &o);
+\t/* wmt_ic_soc.c: the efuse PALDO (VCN28) goes off after the calibration */
+\tmtk_pwrap_write_regulator(PMIC_VCN28_CON0, 0x1, 0x0);
+\tvw.wmt = c >= 0;
+\tsay("wmt: %s; VCN28 off. Next: wifi fw\\n", c >= 0 ? "done" : "calibration FAILED");""",
+        """\tif (rn >= 16) {
+\t\tsay("wmt: GEN_HCR 0x%02x%02x%02x%02x (BTIF %s)\\n", ev[15], ev[14], ev[13], ev[12],
+\t\t    st.dmaOn ? "AP-DMA TX" : "PIO");
+\t}
+\t/* MT6768 PDA MCU patch over BTIF TX AP-DMA in mandatory mode, BEFORE STP full mode */
+\t{
+\t\tstatic uint8_t pbuf[65536];
+\t\tstruct fw_file pf;
+\t\tint perr = fw_open("soc1_0_patch_mcu_1a_1_hdr.bin", &pf);
+\t\tif (perr != 0 || pf.size <= 30 || pf.size > sizeof(pbuf)) {
+\t\t\tsay("wmt: soc1_0_patch_mcu_1a_1_hdr.bin error %d (size %u)\\n", perr, perr == 0 ? pf.size : 0);
+\t\t\tif (perr == 0) fw_close(&pf);
+\t\t\treturn o;
+\t\t}
+\t\tperr = fw_read(&pf, pbuf, pf.size, 0);
+\t\tfw_close(&pf);
+\t\tif (perr != 0) {
+\t\t\tsay("wmt: soc1_0_patch_mcu_1a_1_hdr.bin read error %d\\n", perr);
+\t\t\treturn o;
+\t\t}
+\t\tuint32_t body = pf.size - 30, target = 0;
+\t\tmemcpy(&target, pbuf + 24, 4);
+\t\ttarget &= ~0xffu; /* 0x0001c011 -> 0x0001c000 */
+\t\t/* Pull BTIF_WAK low before PDA patch so RAM handover does not take a spurious wake IRQ */
+\t\trmw(BTIF_WAK, 1, 0);
+\t\tdelay(5000);
+\t\tuint8_t pda[21] = {
+\t\t\t0x01, 0x01, 0x11, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2f, 0x02, 0x02, 0x00,
+\t\t};
+\t\tstatic const uint8_t pdaEv[] = { 0x02, 0x01, 0x01, 0x00, 0x00 };
+\t\tmemcpy(pda + 5, &target, 4);
+\t\tmemcpy(pda + 9, &body, 4);
+\t\tif (wmt_cmd("pda cfg", pda, sizeof(pda), pdaEv, sizeof(pdaEv), 1000, ev, sizeof(ev), out, len, &o) < 0) {
+\t\t\treturn o;
+\t\t}
+\t\tuint8_t head[12] = { 0 };
+\t\tuint32_t hlen = body + 12;
+\t\tmemcpy(head, &hlen, 4);
+\t\tbool txok = btif_put(head, sizeof(head));
+\t\tfor (uint32_t at = 0; txok && at < body; at += 1000) {
+\t\t\ttxok = btif_put(pbuf + 30 + at, MIN(1000u, body - at));
+\t\t}
+\t\tif (!txok) {
+\t\t\tsay("wmt: PDA patch stream failed (LSR 0x%02x)\\n", rd(BTIF_LSR) & 0xff);
+\t\t\treturn o;
+\t\t}
+\t\t/* Write MCU patch buildtime to EMI +0x68330 (15 chars + NUL) before WMT reset */
+\t\tuint8_t dt[16];
+\t\tmemcpy(dt, pbuf, 15);
+\t\tdt[15] = 0;
+\t\tmemcpy((char *)vw.emi + 0x68330, dt, 16);
+\t\tmt6631_wifi_emi_flush(0x68300, 64);
+\t\tdelay(50000);
+\t\tsay("wmt: PDA patch %u bytes -> 0x%08x sent (pc 0x%08x)\\n", body, target, rd(CONN_MCU_PC));
+\t\tstatic const uint8_t rst[] = { 0x01, 0x07, 0x01, 0x00, 0x04 };
+\t\tstatic const uint8_t rstEv[] = { 0x02, 0x07, 0x01, 0x00, 0x00 };
+\t\tif (wmt_cmd("wmt reset", rst, sizeof(rst), rstEv, sizeof(rstEv), 2000, ev, sizeof(ev), out, len, &o) < 0) {
+\t\t\treturn o;
+\t\t}
+\t}
+\tstatic const uint8_t qstp[] = { 0x01, 0x04, 0x01, 0x00, 0x04 };
+\tstatic const uint8_t qstpDef[] = { 0x02, 0x04, 0x06, 0x00, 0x00, 0x04, 0x11, 0x00, 0x00, 0x00 };
+\tstatic const uint8_t qstpFull[] = { 0x02, 0x04, 0x06, 0x00, 0x00, 0x04, 0xdb, 0x0e, 0x68, 0x01 };
+\tstatic const uint8_t sstp[] = { 0x01, 0x04, 0x05, 0x00, 0x03, 0xdb, 0x0e, 0x68, 0x01 };
+\tstatic const uint8_t sstpEv[] = { 0x02, 0x04, 0x02, 0x00, 0x00, 0x03 };
+\t(void)wmt_cmd("query stp", qstp, sizeof(qstp), qstpDef, sizeof(qstpDef), 1000, ev, sizeof(ev), out, len, &o);
+\tif (wmt_cmd("set stp full", sstp, sizeof(sstp), sstpEv, sizeof(sstpEv), 1000, ev, sizeof(ev), out, len, &o) < 0) {
+\t\treturn o;
+\t}
+\tst.full = true;                                 /* host side switch, 10 ms */
+\tst.txseq = 0;
+\tst.txack = 7;
+\tdelay(10000);
+\tif (wmt_cmd("query stp (full)", qstp, sizeof(qstp), qstpFull, sizeof(qstpFull), 1000, ev, sizeof(ev), out, len,
+\t    &o) < 0) {
+\t\treturn o;
+\t}
+\tstatic const uint8_t chipid[] = { 0x01, 0x02, 0x05, 0x00, 0x11, 0x68, 0x67, 0x00, 0x00 };
+\tstatic const uint8_t chipidEv[] = { 0x02, 0x02, 0x01, 0x00, 0x00 };
+\tif (wmt_cmd("set chip id 0x6768", chipid, sizeof(chipid), chipidEv, sizeof(chipidEv), 1000, ev, sizeof(ev), out,
+\t    len, &o) < 0) {
+\t\treturn o;
+\t}
+\tstatic const uint8_t adie[] = { 0x01, 0x02, 0x01, 0x00, 0x12 };
+\tstatic const uint8_t adieEv[] = { 0x02, 0x02, 0x05, 0x00, 0x00 };
+\t(void)wmt_cmd("query a-die", adie, sizeof(adie), adieEv, sizeof(adieEv), 1000, ev, sizeof(ev), out, len, &o);
+\tdelay(5000);
+\tstatic const uint8_t lte[] = { 0x01, 0x10, 0x02, 0x00, 0x15, 0x01 };
+\tstatic const uint8_t coexEv[] = { 0x02, 0x10, 0x01, 0x00, 0x00 };
+\t(void)wmt_cmd("lte coex", lte, sizeof(lte), coexEv, sizeof(coexEv), 1000, ev, sizeof(ev), out, len, &o);
+\tstatic const uint8_t tssi[] = { 0x01, 0x02, 0x04, 0x00, 0x10, 0x03, 0xc0, 0x0e };
+\t(void)wmt_cmd("bt tssi", tssi, sizeof(tssi), chipidEv, sizeof(chipidEv), 1000, ev, sizeof(ev), out, len, &o);
+\tstatic const uint8_t cal[] = { 0x01, 0x14, 0x01, 0x00, 0x01 };
+\tstatic const uint8_t calEv[] = { 0x02, 0x14 };
+\tint c = wmt_cmd("rf calibration", cal, sizeof(cal), calEv, sizeof(calEv), 5000, ev, sizeof(ev), out, len, &o);
+\tstatic const uint8_t adj1[] = { 0x01, 0x10, 0x04, 0x00, 0x1e, 0x00, 0x00, 0x00 };
+\tstatic const uint8_t adj2[] = { 0x01, 0x10, 0x04, 0x00, 0x1f, 0x00, 0x00, 0x00 };
+\tstatic const uint8_t adj3[] = { 0x01, 0x10, 0x04, 0x00, 0x20, 0x00, 0x00, 0x00 };
+\tstatic const uint8_t fm[] = { 0x01, 0x05, 0x02, 0x00, 0x02, 0x02 };
+\tstatic const uint8_t fmEv[] = { 0x02, 0x05, 0x02, 0x00, 0x00, 0x02 };
+\t(void)wmt_cmd("coex bt", adj1, sizeof(adj1), coexEv, sizeof(coexEv), 1000, ev, sizeof(ev), out, len, &o);
+\t(void)wmt_cmd("coex opp", adj2, sizeof(adj2), coexEv, sizeof(coexEv), 1000, ev, sizeof(ev), out, len, &o);
+\t(void)wmt_cmd("coex ble", adj3, sizeof(adj3), coexEv, sizeof(coexEv), 1000, ev, sizeof(ev), out, len, &o);
+\t(void)wmt_cmd("fm strap", fm, sizeof(fm), fmEv, sizeof(fmEv), 1000, ev, sizeof(ev), out, len, &o);
+\t/* wmt_ic_soc.c: the efuse PALDO (VCN28) goes off after the calibration */
+\tmtk_pwrap_write_regulator(PMIC_VCN28_CON0, 0x1, 0x0);
+\tvw.wmt = c >= 0;
+\tsay("wmt: %s; VCN28 off. Next: wifi fw\\n", c >= 0 ? "done" : "calibration FAILED");""",
+        "mt6631_wifi.c: MT6768 PDA patch download and WMT init sequence",
+    )
+
+    # WFDMA DMA_SIZE, preserve BTIF TX vFIFO, WIFI_RAM_CODE filename, and CONNAC1 16-byte RXD
+    replace_exact(
+        wc,
+        """#define DMA_SIZE                0x48000
+#define OFF_TX(n)               ((n) == 3 ? 0x0000u : (n) == 15 ? 0x0100u : (n) == 0 ? 0x41000u : 0x0300u)
+#define TX0_N                   32              /* data ring: 32 entries at 0x41000, 2 KiB buffers in ring 3's area */
+#define TX0_BUF                 0x800
+#define RING_LEN(n)             ((n) == 0 ? TX0_N : RING_N)
+#define OFF_RX(n)               ((n) == 0 ? 0x0400u : 0x0500u)
+#define OFF_TXBUF               0x01000u        /* ring 3 then ring 15 buffers: 16 x 4 KiB each */
+#define OFF_RXBUF(n)            ((n) == 1 ? 0x21000u : 0x31000u)
+#define WIFI_RAM_CODE           "WIFI_RAM_CODE_soc2_2_2_1.bin"
+#define PDA_CHUNK               2048""",
+        """#define DMA_SIZE                0x4c000
+#define WFDMA_SIZE              0x48000         /* 0x48000..0x4c000 belongs to BTIF TX AP-DMA vFIFO */
+#define OFF_TX(n)               ((n) == 3 ? 0x0000u : (n) == 15 ? 0x0100u : (n) == 0 ? 0x41000u : 0x0300u)
+#define TX0_N                   32              /* data ring: 32 entries at 0x41000, 2 KiB buffers in ring 3's area */
+#define TX0_BUF                 0x800
+#define RING_LEN(n)             ((n) == 0 ? TX0_N : RING_N)
+#define OFF_RX(n)               ((n) == 0 ? 0x0400u : 0x0500u)
+#define OFF_TXBUF               0x01000u        /* ring 3 then ring 15 buffers: 16 x 4 KiB each */
+#define OFF_RXBUF(n)            ((n) == 1 ? 0x21000u : 0x31000u)
+#define WIFI_RAM_CODE           "WIFI_RAM_CODE_soc1_0_1a_1.bin"
+#define PDA_CHUNK               2048
+#define RXD_SIZE                16u             /* CONNAC1 (nic_rxd_v1): 16-byte RX descriptor */""",
+        "mt6631_wifi.c: WIFI_RAM_CODE_soc1_0_1a_1.bin, WFDMA_SIZE, CONNAC1 RXD_SIZE=16",
+    )
+
+    replace_exact(
+        wc,
+        """\tbzero(wd.va, DMA_SIZE);
+\tmt6631_wifi_dma_flush(0, DMA_SIZE);               /* before any descriptor goes in through wd.uva */
+\tstatic const uint32_t tx[] = { 0, 1, 3, 15 };
+\tfor (unsigned r = 0; r < 2; r++) {
+\t\tfor (uint32_t i = 0; i < RING_N; i++) {
+\t\t\tuint32_t *d = desc(OFF_RX(r), i);
+\t\t\td[0] = (uint32_t)(wd.pa + OFF_RXBUF(r) + BUF_SZ * i);
+\t\t\td[1] = (uint32_t)RX_BUF_LEN << 16;
+\t\t}
+\t}
+\tmt6631_wifi_dma_flush(0, DMA_SIZE);""",
+        """\tbzero(wd.va, WFDMA_SIZE);
+\tmt6631_wifi_dma_flush(0, WFDMA_SIZE);             /* keep BTIF TX vFIFO at 0x48000 untouched */
+\tstatic const uint32_t tx[] = { 0, 1, 3, 15 };
+\tfor (unsigned r = 0; r < 2; r++) {
+\t\tfor (uint32_t i = 0; i < RING_N; i++) {
+\t\t\tuint32_t *d = desc(OFF_RX(r), i);
+\t\t\td[0] = (uint32_t)(wd.pa + OFF_RXBUF(r) + BUF_SZ * i);
+\t\t\td[1] = (uint32_t)RX_BUF_LEN << 16;
+\t\t}
+\t}
+\tmt6631_wifi_dma_flush(0, WFDMA_SIZE);""",
+        "mt6631_wifi.c: preserve BTIF TX AP-DMA vFIFO in wfdma_setup",
+    )
+
+    # CONNAC1 16-byte RXD offsets across init_cmd, rx_classify, rx_rssi, wifi_cmd, wifi_cap, wifi_event, hw_ch_privilege
+    replace_exact(
+        wc,
+        """\t\tuint8_t *e = ev + 20;
+\t\tif (got >= 32 && e[4] == 1 && e[5] == seq) {""",
+        """\t\tuint8_t *e = ev + RXD_SIZE;
+\t\tif (got >= RXD_SIZE + 12 && e[4] == 1 && e[5] == seq) {""",
+        "mt6631_wifi.c: CONNAC1 16-byte RXD in init_cmd",
+    )
+
+    replace_exact(
+        wc,
+        """\tif (n < 20) {
+\t\treturn 0;
+\t}
+\tuint16_t ptype = (uint16_t)(b[2] | b[3] << 8);
+\tif ((ptype & 0xe00f) == 0xe000) {
+\t\treturn n >= 32 ? PKT_EVENT : 0;
+\t}
+\tuint32_t type = ptype >> 13;
+\tif ((ptype & 0xe00f) != 0xe001 && type != 2) {
+\t\treturn 0;                               /* TX status, RX vector, MSDU report: not used */
+\t}
+\tuint32_t off = 20 + ((ptype & (1u << 12)) ? 16 : 0) + ((ptype & (1u << 9)) ? 16 : 0) +""",
+        """\tif (n < RXD_SIZE) {
+\t\treturn 0;
+\t}
+\tuint16_t ptype = (uint16_t)(b[2] | b[3] << 8);
+\tif ((ptype & 0xe00f) == 0xe000) {
+\t\treturn n >= RXD_SIZE + 12 ? PKT_EVENT : 0;
+\t}
+\tuint32_t type = ptype >> 13;
+\tif ((ptype & 0xe00f) != 0xe001 && type != 2) {
+\t\treturn 0;                               /* TX status, RX vector, MSDU report: not used */
+\t}
+\tuint32_t off = RXD_SIZE + ((ptype & (1u << 12)) ? 16 : 0) + ((ptype & (1u << 9)) ? 16 : 0) +""",
+        "mt6631_wifi.c: CONNAC1 16-byte RXD in rx_classify",
+    )
+
+    replace_exact(
+        wc,
+        """\tuint32_t g3 = 20 + ((ptype & (1u << 12)) ? 16 : 0) + ((ptype & (1u << 9)) ? 16 : 0) + ((ptype & (1u << 10)) ? 8 : 0);""",
+        """\tuint32_t g3 = RXD_SIZE + ((ptype & (1u << 12)) ? 16 : 0) + ((ptype & (1u << 9)) ? 16 : 0) + ((ptype & (1u << 10)) ? 8 : 0);""",
+        "mt6631_wifi.c: CONNAC1 16-byte RXD in rx_rssi",
+    )
+
+    replace_exact(
+        wc,
+        """\t\tuint8_t *e = ev + 20;
+\t\tif (eid != 0 && e[4] == eid) {""",
+        """\t\tuint8_t *e = ev + RXD_SIZE;
+\t\tif (eid != 0 && e[4] == eid) {""",
+        "mt6631_wifi.c: CONNAC1 16-byte RXD in wifi_cmd",
+    )
+
+    replace_exact(
+        wc,
+        """\tif (n < 36) {
+\t\tsay("cap: no NIC_CAPABILITY_V2 event\\n");
+\t\treturn o;
+\t}
+\tuint8_t *b = ev + 20 + 12;
+\tuint32_t count = b[0] | b[1] << 8, off = 4, end = (uint32_t)MIN(n, (int)sizeof(ev)) - 32;""",
+        """\tif (n < (int)(RXD_SIZE + 16)) {
+\t\tsay("cap: no NIC_CAPABILITY_V2 event\\n");
+\t\treturn o;
+\t}
+\tuint8_t *b = ev + RXD_SIZE + 12;
+\tuint32_t count = b[0] | b[1] << 8, off = 4, end = (uint32_t)MIN(n, (int)sizeof(ev)) - (RXD_SIZE + 12);""",
+        "mt6631_wifi.c: CONNAC1 16-byte RXD in wifi_cap",
+    )
+
+    replace_exact(
+        wc,
+        """\tuint8_t act[12] = { 0, 1, 0, 1 };               /* BSS 0 active, AIS, own MAC index 1 */
+\tmemcpy(act + 4, wl.mac, 6);
+\tact[10] = 4;                                    /* broadcast/multicast WTBL entry */""",
+        """\tuint8_t act[12] = { 0, 1, 0, 0 };               /* CONNAC1: BSS 0 active, AIS, own MAC index 0 */
+\tmemcpy(act + 4, wl.mac, 6);
+\tact[10] = 2;                                    /* CONNAC1: broadcast/multicast WTBL entry 2 */""",
+        "mt6631_wifi.c: CONNAC1 OMAC=0 and WTBL_BMC=2 in BSS_ACTIVATE_CTRL",
+    )
+
+    replace_exact(
+        wc,
+        """\tconst uint8_t *e = ev + 20, *d = ev + 32;
+\twl.events++;
+\tswitch (e[4]) {
+\tcase EID_SCAN_DONE:
+\t\tif (wl.scanBusy && got >= 38 && d[0] == wl.scanSeq) {""",
+        """\tconst uint8_t *e = ev + RXD_SIZE, *d = ev + RXD_SIZE + 12;
+\twl.events++;
+\tswitch (e[4]) {
+\tcase EID_SCAN_DONE:
+\t\tif (wl.scanBusy && got >= RXD_SIZE + 18 && d[0] == wl.scanSeq) {""",
+        "mt6631_wifi.c: CONNAC1 16-byte RXD in wifi_event",
+    )
+
+    # CONNAC1 WTBL, TXD, unencrypted EAPOL over TX ring 15, CH_PRIVILEGE event offset, STAREC v1, RSC in hw_key
+    replace_exact(
+        wc,
+        """#define WTBL_AP                 5
+#define WTBL_BMC                4""",
+        """#define WTBL_AP                 1
+#define WTBL_BMC                2""",
+        "mt6631_wifi.c: CONNAC1 WTBL_AP=1, WTBL_BMC=2",
+    )
+
+    replace_exact(
+        wc,
+        """\tt[3] = 0x04;                                    /* LMAC, queue 1 = AC_BE (WMM set 0) */
+\tt[4] = WTBL_AP;
+\tt[5] = type >= 0x600 ? 0x90 : 0x80;             /* long, non-802.11, Ethernet II */
+\tt[7] = 0x04;                                    /* PktFt 0, own MAC 1 */""",
+        """\tt[3] = 0x00;                                    /* CONNAC1: LMAC AC0 */
+\tt[4] = WTBL_AP;
+\tt[5] = type >= 0x600 ? 0x90 : 0x80;             /* long, non-802.11, Ethernet II */
+\tt[7] = 0x00;                                    /* CONNAC1: PktFt 0, own MAC 0 */""",
+        "mt6631_wifi.c: CONNAC1 OMAC=0 and AC0 in tx_data",
+    )
+
+    replace_exact(
+        wc,
+        """\tpkt[7] = 0x06;                                  /* PktFt 2, own MAC 1 */""",
+        """\tpkt[7] = 0x02;                                  /* CONNAC1: PktFt 2, own MAC 0 */""",
+        "mt6631_wifi.c: CONNAC1 OMAC=0 in tx_mgmt",
+    )
+
+    replace_exact(
+        wc,
+        """static int
+hw_tx(const uint8_t *frame, uint32_t len, bool mgmt, bool protect)
+{
+\tif (mgmt) {
+\t\treturn tx_mgmt(frame, len);
+\t}
+\tbool eapol = len >= 14 && frame[12] == 0x88 && frame[13] == 0x8e;
+\tif (eapol && len >= 14 + 7) {
+\t\t/* EAPOL-Key with the pairwise bit (4-way M2/M4) never protected; group-key M2 is once the PTK is in */
+\t\tuint16_t info = (uint16_t)(frame[14 + 5] << 8 | frame[14 + 6]);
+\t\tprotect = tx0.ptk && !(frame[14 + 1] == 3 && (info & 0x0008));
+\t} else {
+\t\tprotect = protect && tx0.ptk;
+\t}
+\treturn tx_data(frame, len, protect, eapol);
+}""",
+        """/* Unencrypted EAPOL (4-way M2/M4) on TX ring 15 as security frame to MCU Q1 at lowest basic rate (CONNAC1) */
+static int
+tx_eapol_cmd(const uint8_t *eth, uint32_t len)
+{
+\tstatic uint8_t pkt[32 + 512];
+\tif (len < 14 || len > 512) {
+\t\treturn -1;
+\t}
+\tbzero(pkt, 32);
+\tput16(pkt + 0, 32 + len);
+\tpkt[2] = 0x08;                                  /* (12 + 4) / 2 */
+\tpkt[3] = 0x84;                                  /* MCU port, MCU_Q1 */
+\tpkt[4] = WTBL_AP;
+\tpkt[5] = 0x90;                                  /* long, non-802.11, Ethernet II */
+\tpkt[7] = 0x02;                                  /* PktFt 2 (CMD), own MAC 0 */
+\tpkt[11] = 0x80;                                 /* fixed rate */
+\tput16(pkt + 12, 15u << 11);
+\tput16(pkt + 26, rate_code());
+\tmemcpy(pkt + 32, eth, len);
+\treturn wfdma_tx(15, pkt, 32 + len) ? 0 : -1;
+}
+
+static int
+hw_tx(const uint8_t *frame, uint32_t len, bool mgmt, bool protect)
+{
+\tif (mgmt) {
+\t\treturn tx_mgmt(frame, len);
+\t}
+\tbool eapol = len >= 14 && frame[12] == 0x88 && frame[13] == 0x8e;
+\tif (eapol && len >= 14 + 7) {
+\t\t/* EAPOL-Key with the pairwise bit (4-way M2/M4) never protected; group-key M2 is once the PTK is in */
+\t\tuint16_t info = (uint16_t)(frame[14 + 5] << 8 | frame[14 + 6]);
+\t\tprotect = tx0.ptk && !(frame[14 + 1] == 3 && (info & 0x0008));
+\t\tif (!protect) {
+\t\t\treturn tx_eapol_cmd(frame, len);
+\t\t}
+\t} else {
+\t\tprotect = protect && tx0.ptk;
+\t}
+\treturn tx_data(frame, len, protect, eapol);
+}""",
+        "mt6631_wifi.c: CONNAC1 unencrypted EAPOL over TX ring 15",
+    )
+
+    replace_exact(
+        wc,
+        """\tif (n >= 32 + 3 && ev[33] == tx0.chToken && ev[34] == 0) {
+\t\treturn 0;
+\t}
+\tprintf("WIFI: channel %u: no grant (%d bytes, token %u/%u, status %u)\\n", sj.ap.ch, n, n > 33 ? ev[33] : 0,
+\t    tx0.chToken, n > 34 ? ev[34] : 0);""",
+        """\tif (n >= (int)(RXD_SIZE + 12 + 3) && ev[RXD_SIZE + 13] == tx0.chToken && ev[RXD_SIZE + 14] == 0) {
+\t\treturn 0;
+\t}
+\tprintf("WIFI: channel %u: no grant (%d bytes, token %u/%u, status %u)\\n", sj.ap.ch, n,
+\t    n > (int)(RXD_SIZE + 13) ? ev[RXD_SIZE + 13] : 0, tx0.chToken,
+\t    n > (int)(RXD_SIZE + 14) ? ev[RXD_SIZE + 14] : 0);""",
+        "mt6631_wifi.c: CONNAC1 16-byte RXD in hw_ch_privilege",
+    )
+
+    replace_exact(
+        wc,
+        """\tp[54] = WTBL_AP;
+\tp[55] = 0xff;""",
+        """\tp[23] = 1;                                      /* CONNAC1: CMD_UPDATE_STAREC_VER1 */
+\tp[50] = (uint8_t)((sj.ap.rssi + 110) * 2);      /* RCPI */
+\tp[54] = WTBL_AP;
+\tp[55] = WTBL_BMC;""",
+        "mt6631_wifi.c: CONNAC1 STAREC_VER1, RCPI, and WTBL_BMC in hw_sta_rec",
+    )
+
+    replace_exact(
+        wc,
+        """\t(void)rsc;                                      /* gen4m never sends it for CCMP */
+\tif (klen != 16 && klen != 32) {
+\t\treturn -1;
+\t}
+\tbzero(p, sizeof(p));
+\tp[0] = 1;
+\tp[1] = pairwise ? 1 : 0;
+\tp[2] = pairwise ? 1 : 0;
+\tmemcpy(p + 4, sj.ap.bssid, 6);
+\tp[11] = klen == 32 ? 2 : 4;                     /* TKIP (group only) / CCMP */
+\tp[12] = keyid;
+\tp[13] = (uint8_t)klen;
+\tp[14] = pairwise ? WTBL_AP : WTBL_BMC;
+\tmemcpy(p + 16, key, klen);""",
+        """\tif (klen != 16 && klen != 32) {
+\t\treturn -1;
+\t}
+\tbzero(p, sizeof(p));
+\tp[0] = 1;
+\tp[1] = pairwise ? 1 : 0;
+\tp[2] = pairwise ? 1 : 0;
+\tmemcpy(p + 4, sj.ap.bssid, 6);
+\tp[11] = klen == 32 ? 2 : 4;                     /* TKIP (group only) / CCMP */
+\tp[12] = keyid;
+\tp[13] = (uint8_t)klen;
+\tp[14] = pairwise ? WTBL_AP : WTBL_BMC;
+\tmemcpy(p + 16, key, klen);
+\tif (rsc != NULL) {
+\t\tmemcpy(p + 48, rsc, 8);
+\t}""",
+        "mt6631_wifi.c: pass RSC to ADD_REMOVE_KEY for group keys",
+    )
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("Usage: apply_a32_overlay.py <path/to/xnu>")
     xnu = Path(sys.argv[1]).resolve()
-    print(f"Applying SM-A325M (MT6769T) XNU overlay (Hito 3+4+5) to {xnu}:")
+    print(f"Applying SM-A325M (MT6769T) XNU overlay (Hito 3+4+5+6+7) to {xnu}:")
     copy_drivers(xnu)
     patch_build_lists(xnu)
     patch_mtk_ufs(xnu)
@@ -1288,6 +2587,7 @@ def main():
     patch_framebuffer(xnu)
     patch_usb_link(xnu)
     patch_gpu_mt6768(xnu)
+    patch_wifi_mt6768(xnu)
     print("Overlay applied cleanly!")
 
 
