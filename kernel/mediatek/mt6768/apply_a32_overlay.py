@@ -851,8 +851,25 @@ def patch_usb_link(xnu: Path):
         '\t\t\t\t\tvl_reply("fpatch %s +0x%llx: 0x%016llx -> 0x%016llx (%s %d)\\n", rest, off, cur, val, err ? "ERR" : "ok", err);\n'
         '\t\t\t\t}\n'
         '\t\t\t}\n'
+        '\t\t}\n'
+        '\t} else if (IS("growfs")) {\n'
+        '\t\tuint64_t newsz = 0;\n'
+        '\t\tif (!vl_arg(&rest, &newsz) || newsz == 0) {\n'
+        '\t\t\tvl_reply("usage: growfs NEW_BYTES (e.g. 0x980000000 for 38 GiB)\\n");\n'
+        '\t\t} else if (rootvnode == NULLVP) {\n'
+        '\t\t\tvl_reply("growfs: no rootvnode\\n");\n'
+        '\t\t} else {\n'
+        '\t\t\textern int hfs_extendfs(void *hfsmp, uint64_t newsize, vfs_context_t context);\n'
+        '\t\t\tmount_t mp = vnode_mount(rootvnode);\n'
+        '\t\t\tvoid *hfsmp = mp ? vfs_fsprivate(mp) : NULL;\n'
+        '\t\t\tif (hfsmp == NULL) {\n'
+        '\t\t\t\tvl_reply("growfs: no hfsmp\\n");\n'
+        '\t\t\t} else {\n'
+        '\t\t\t\tint err = hfs_extendfs(hfsmp, newsz, vfs_context_kernel());\n'
+        '\t\t\t\tvl_reply("growfs 0x%llx (%llu MiB): %s (%d)\\n", newsz, newsz >> 20, err ? "ERR" : "ok", err);\n'
+        '\t\t\t}\n'
         '\t\t}',
-        "usb_link.c: add chown and fpatch commands for live rootfs repair",
+        "usb_link.c: add chown, fpatch, and growfs commands for live rootfs repair/resize",
     )
 
 
@@ -1314,9 +1331,13 @@ def patch_wifi_mt6768(xnu: Path) -> None:
 \t\t\t    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, masks[i]);
 \t\t}""",
         """\tif (gMappleWiFiEMI == NULL) {
-\t\t/* MT6768 INFRA_EMI_MAPPING (0x10001380) takes PA >> 24: EMI MUST be 16 MiB aligned */
-\t\tgMappleWiFiEMI = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-\t\t    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000ff000000ull);""",
+\t\t/* MT6768 INFRA_EMI_MAPPING (0x10001380) takes PA >> 24: EMI MUST be 16 MiB aligned.
+\t\t * Prefer < 2 GiB (inside DT alloc-ranges 0x40000000..0xc0000000), fallback < 4 GiB. */
+\t\tstatic const uint64_t masks[] = { 0x000000007f000000ull, 0x00000000ff000000ull };
+\t\tfor (unsigned i = 0; i < 2 && gMappleWiFiEMI == NULL; i++) {
+\t\t\tgMappleWiFiEMI = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+\t\t\t    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, masks[i]);
+\t\t}""",
         "MT6631WiFi.cpp: strictly 16 MiB aligned EMI window on MT6768",
     )
     replace_exact(
@@ -1428,6 +1449,27 @@ def patch_wifi_mt6768(xnu: Path) -> None:
 \t    rd(INFRA_EMI_MAPPING), rd(TOPRGU_SWSYSRST), !!(rd(TOPRGU_SWSYSRST) & (1u << 12)), rd(GPIO_MODE23),
 \t    rd(GPIO_MODE24), pmic(PMIC_DCXO_CW00));""",
         "mt6631_wifi.c: wifi_status show MT6768 pinmux and DCXO_CW00",
+    )
+
+    replace_exact(
+        wc,
+        """\tuint32_t ana18 = pmic(PMIC_VCN18_ANA);
+\tif (((ana18 >> 8) & 0xf) != 12) {
+\t\tsay("detect: VCN18 voltage select %u is not 1.8 V: refused (no voltage writes here)\\n", (ana18 >> 8) & 0xf);
+\t\treturn o;
+\t}""",
+        """\t/* MT6358 VCN18 is fixed 1.8 V LDO (wifi_detect: no VOSEL, 0x1e8c reads 0). */""",
+        "mt6631_wifi.c: MT6358 VCN18 is fixed 1.8 V in wifi_detect",
+    )
+
+    replace_exact(
+        wc,
+        """\tif (((pmic(PMIC_VCN18_ANA) >> 8) & 0xf) != 12) {
+\t\tsay("on: VCN18 is not 1.8 V: refused\\n");
+\t\treturn o;
+\t}""",
+        """\t/* MT6358 VCN18 is fixed 1.8 V LDO (wifi_on: no VOSEL, 0x1e8c reads 0). */""",
+        "mt6631_wifi.c: MT6358 VCN18 is fixed 1.8 V in wifi_on",
     )
 
     replace_exact(
