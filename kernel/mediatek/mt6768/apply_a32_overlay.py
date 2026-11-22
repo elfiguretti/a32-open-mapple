@@ -430,6 +430,39 @@ a32_dsi_set_brightness(uint32_t level_0_2047)
 \treturn 1;
 }
 
+int a32_dsi_set_fps(uint32_t hz);
+int
+a32_dsi_set_fps(uint32_t hz)
+{
+\tif (!a32_hw_ready || a32_dsi0_va == 0 || a32_mutex_va == 0) {
+\t\treturn 0;
+\t}
+\tif (hz != 60u && hz != 90u) {
+\t\treturn 0;
+\t}
+\tif (os_atomic_xchg(&a32_dsi_dcs_busy, 1u, acq_rel) != 0) {
+\t\treturn 0;
+\t}
+\t__asm__ volatile("dsb sy" ::: "memory");
+\tif (a32_dsi_is_busy()) {
+\t\tuint64_t deadline = a32_cntpct_now() + 520000ULL;
+\t\twhile (a32_dsi_is_busy()) {
+\t\t\tif (a32_cntpct_now() >= deadline) {
+\t\t\t\tos_atomic_store(&a32_dsi_dcs_busy, 0u, release);
+\t\t\t\treturn 0;
+\t\t\t}
+\t\t}
+\t}
+\t/* Samsung S6E3FC3 (s6e3fc3_a32.c / s6e3fc3_a32_param.h): F0 5A 5A -> 60 (08|00) 00 -> F7 0F -> F0 A5 A5 */
+\tuint32_t w0_long3 = (3u << 16) | (0x39u << 8) | 0x0au;
+\ta32_dsi_send_cmdq(w0_long3, 0x005a5af0u, 2u);
+\ta32_dsi_send_cmdq(w0_long3, (hz == 90u) ? 0x00000860u : 0x00000060u, 2u);
+\ta32_dsi_send_cmdq(0x0ff71508u, 0u, 1u);
+\ta32_dsi_send_cmdq(w0_long3, 0x00a5a5f0u, 2u);
+\tos_atomic_store(&a32_dsi_dcs_busy, 0u, release);
+\treturn 1;
+}
+
 void a32_console_hw_init(void);
 void
 a32_console_hw_init(void)
@@ -572,6 +605,7 @@ def patch_framebuffer(xnu: Path):
 extern "C" int a32_dsi_is_busy_ext(void);                /* bsd/dev/mtk_ufs.c (SM-A325M DSI CMD) */
 extern "C" void a32_dsi_cmd_flush_now(void);             /* bsd/dev/mtk_ufs.c (SM-A325M DSI CMD) */
 extern "C" int a32_dsi_set_brightness(uint32_t level);   /* bsd/dev/mtk_ufs.c (SM-A325M S6E3FC3 DCS) */
+extern "C" int a32_dsi_set_fps(uint32_t hz);             /* bsd/dev/mtk_ufs.c (SM-A325M S6E3FC3 60/90 Hz) */
 extern "C" void a32_touch_display_power(int on);         /* hid/STMTS.cpp */"""
     replace_exact(p, old_decl, new_decl, "MappleFramebuffer.cpp: declare a32 DSI helpers at top")
 
@@ -628,8 +662,85 @@ extern "C" void a32_touch_display_power(int on);         /* hid/STMTS.cpp */"""
 
     old_pwr = """\t\t\tIOLog("FB: display %s\\n", off ? "off" : "on");"""
     new_pwr = """\t\t\tIOLog("FB: display %s\\n", off ? "off" : "on");
+\t\t\tif (!off && fPanelHz == 90) {
+\t\t\t\ta32_dsi_set_fps(90);
+\t\t\t}
 \t\t\ta32_touch_display_power(off ? 0 : 1);"""
-    replace_exact(p, old_pwr, new_pwr, "MappleFramebuffer.cpp: notify STMTS on display power change")
+    replace_exact(p, old_pwr, new_pwr, "MappleFramebuffer.cpp: notify STMTS and restore 90 Hz on display wake")
+
+    old_period = """\tuint64_t periodOr60(void)
+\t{
+\t\tuint64_t p = fPeriod;
+\t\tif (p == 0) {
+\t\t\tnanoseconds_to_absolutetime(16666667, &p);
+\t\t}
+\t\treturn p;
+\t}"""
+    new_period = """\tuint64_t periodOr60(void)
+\t{
+\t\tuint64_t p = fPeriod;
+\t\tif (p == 0) {
+\t\t\tnanoseconds_to_absolutetime((uint64_t)(fTickUs ? fTickUs : MAPPLE_FB_VSYNC_US) * 1000ull, &p);
+\t\t}
+\t\treturn p;
+\t}"""
+    replace_exact(p, old_period, new_period, "MappleFramebuffer.cpp: use fTickUs in periodOr60() for 90 Hz")
+
+    old_hz = """\tfVsync->setTimeoutUS(MAPPLE_FB_VSYNC_US);
+
+\tsetProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+\tsetProperty("external", false);
+\tsetProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);     /* 0191: 200 nits until set */
+\tif (fHzMode != 60) {"""
+    new_hz = """\tuint32_t a32_hz = 60;
+\tPE_parse_boot_argn("a32_panel_hz", &a32_hz, sizeof(a32_hz));
+\tif (a32_hz == 90 && a32_dsi_set_fps(90)) {
+\t\tfPanelHz = 90;
+\t\tfTickUs = 11111;
+\t\tIOLog("FB: S6E3FC3 panel switched to 90 Hz (11111 us)\\n");
+\t}
+\tfVsync->setTimeoutUS(fTickUs);
+
+\tsetProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+\tsetProperty("external", false);
+\tsetProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);     /* 0191: 200 nits until set */
+\tif (fPanelHz == 90) {
+\t\tOSDictionary *refresh = OSDictionary::withCapacity(2);
+\t\tuint64_t step = 0;
+\t\tnanoseconds_to_absolutetime(11111111, &step);
+\t\tOSNumber *minI = OSNumber::withNumber((unsigned long long)((11111111ull << 32) / 1000000000ull), 32);
+\t\tOSNumber *stepN = OSNumber::withNumber((unsigned long long)step, 32);
+\t\tif (refresh != NULL && minI != NULL && stepN != NULL) {
+\t\t\trefresh->setObject("displayMinRefreshInterval", minI);
+\t\t\trefresh->setObject("displayRefreshStepMachTime", stepN);
+\t\t\tsetProperty("IOMFBDisplayRefresh", refresh);
+\t\t}
+\t\tOSSafeReleaseNULL(minI);
+\t\tOSSafeReleaseNULL(stepN);
+\t\tOSSafeReleaseNULL(refresh);
+\t} else if (fHzMode != 60) {"""
+    replace_exact(p, old_hz, new_hz, "MappleFramebuffer.cpp: a32_panel_hz=90 S6E3FC3 DCS + IOMFBDisplayRefresh")
+
+    old_rearm = """\tif (!fFlipReady) {
+\t\ttimer->setTimeoutUS(fTickUs);
+\t\treturn;
+\t}"""
+    new_rearm = """\tif (!fFlipReady) {
+\t\tstatic uint64_t a32NextTick = 0;
+\t\tuint64_t now = mach_absolute_time(), step = 0;
+\t\tnanoseconds_to_absolutetime((uint64_t)fTickUs * 1000ull, &step);
+\t\tif (a32NextTick == 0 || now >= a32NextTick + 2 * step) {
+\t\t\ta32NextTick = now + step;
+\t\t} else {
+\t\t\ta32NextTick += step;
+\t\t\tif (a32NextTick <= now) {
+\t\t\t\ta32NextTick = now + step;
+\t\t\t}
+\t\t}
+\t\ttimer->wakeAtTime(kIOTimeOptionsSysCritical, a32NextTick, 0);
+\t\treturn;
+\t}"""
+    replace_exact(p, old_rearm, new_rearm, "MappleFramebuffer.cpp: jitter-free critical-urgency phase-locked VSync timer")
 
 
 def patch_pmic(xnu: Path):

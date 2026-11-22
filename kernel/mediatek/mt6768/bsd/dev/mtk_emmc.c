@@ -15,9 +15,12 @@
 #include <pexpert/arm64/board_config.h>
 
 #if defined(ARM64_BOARD_CONFIG_MT6781)
+#include <arm/caches_internal.h>
+#include <kern/clock.h>
 #include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
+#include <machine/machine_routines.h>
 #include <miscfs/devfs/devfs.h>
 #include <pexpert/pexpert.h>
 #include <sys/buf.h>
@@ -26,13 +29,17 @@
 #include <sys/errno.h>
 #include <sys/fcntl.h>
 #include <sys/systm.h>
+#include <vm/pmap.h>
+#include <vm/vm_kern.h>
 
+extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void usblink_probe(void);
 
 #define MSDC0_PHYS              0x11230000UL
 #define EMMC_DEFAULT_PART       "xnusys"
 #define EMMC_MAX_BLOCKS         256U            /* 128 KiB per transfer */
+#define EMMC_DMA_SIZE           (EMMC_MAX_BLOCKS * 512U)
 #define EMMC_FIFO_BYTES         128U
 
 #define MSDC_CFG                0x00U
@@ -48,6 +55,18 @@ extern void usblink_probe(void);
 #define SDC_STS_BUSY            3u              /* SDCBUSY | CMDBUSY */
 #define SDC_RESP0               0x40U
 #define SDC_BLK_NUM             0x50U
+
+/* MT6768 ComboA MSDC0 Basic DMA registers (drivers/mmc/host/mediatek/ComboA/msdc_reg.h) */
+#define MSDC_DMA_SA_HIGH        0x8cU
+#define MSDC_DMA_SA             0x90U
+#define MSDC_DMA_CTRL           0x98U
+#define MSDC_DMA_CFG            0x9cU
+#define MSDC_DMA_LEN            0xa8U
+#define MSDC_DMA_CTRL_START     (1u << 0)
+#define MSDC_DMA_CTRL_STOP      (1u << 1)
+#define MSDC_DMA_CTRL_LASTBUF   (1u << 10)
+#define MSDC_DMA_BURST_64B      6u
+#define MSDC_DMA_CFG_STS        (1u << 0)
 
 #define INT_CMDRDY              (1u << 8)
 #define INT_CMDTMO              (1u << 9)
@@ -83,6 +102,11 @@ static uint32_t emmc_int_seen;
 static const char *emmc_failed;
 static uint32_t emmc_failed_status;
 static uint64_t emmc_errors;
+static vm_offset_t emmc_dma_va;
+static uint64_t emmc_dma_pa;
+static bool emmc_dma_ok;
+static uint64_t emmc_dma_ops;
+static uint32_t emmc_dma_errs;
 
 static uint32_t emmc_sector[128] __attribute__((aligned(16)));
 static uint32_t emmc_gpt_entries[128 * 128 / 4] __attribute__((aligned(16)));
@@ -234,9 +258,108 @@ emmc_read_blocks(uint64_t lba, uint32_t blocks, uint32_t *dst)
 	return blocks == 1u || emmc_stop();
 }
 
+static void
+emmc_dma_stop_quiet(void)
+{
+	if (emmc_rd(MSDC_DMA_CFG) & MSDC_DMA_CFG_STS) {
+		emmc_wr(MSDC_DMA_CTRL, MSDC_DMA_CTRL_STOP);
+		for (uint32_t i = 0; i < 200000U && (emmc_rd(MSDC_DMA_CFG) & MSDC_DMA_CFG_STS); i++) {
+		}
+	}
+}
+
+static bool
+emmc_dma_xfer(uint64_t lba, uint32_t blocks, void *buf, bool write)
+{
+	if (emmc_dma_va == 0 || blocks == 0 || blocks > EMMC_MAX_BLOCKS) {
+		return false;
+	}
+	if (!emmc_wait_idle()) {
+		return false;
+	}
+	emmc_dma_stop_quiet();
+	emmc_wr(MSDC_CFG, emmc_rd(MSDC_CFG) & ~MSDC_CFG_PIO);
+	emmc_wr(MSDC_INT, emmc_rd(MSDC_INT));
+	emmc_int_seen = 0;
+	emmc_wr(MSDC_FIFOCS, emmc_rd(MSDC_FIFOCS) | MSDC_FIFOCS_CLR);
+	for (uint32_t i = 0; i < 100000U && (emmc_rd(MSDC_FIFOCS) & MSDC_FIFOCS_CLR); i++) {
+	}
+
+	uint32_t len = blocks * 512u;
+	if (write) {
+		memcpy((void *)emmc_dma_va, buf, len);
+		clean_dcache64((addr64_t)emmc_dma_pa, len, TRUE);
+	} else {
+		flush_dcache64((addr64_t)emmc_dma_pa, len, TRUE);
+	}
+	__builtin_arm_dsb(0xf);
+
+	emmc_wr(SDC_BLK_NUM, blocks);
+	emmc_wr(SDC_ARG, (uint32_t)lba);
+	emmc_wr(SDC_CMD, (write ? (blocks == 1u ? 24u : 25u) : (blocks == 1u ? 17u : 18u)) |
+	    CMD_RSP_R1 | (write ? CMD_RW : 0u) |
+	    (blocks == 1u ? CMD_DTYPE_SINGLE : CMD_DTYPE_MULTI) | CMD_BLKLEN(512u));
+	if (!emmc_wait_int(INT_CMDRDY, INT_CMDTMO | INT_RSPCRCERR, write ? "dma write cmd" : "dma read cmd")) {
+		return false;
+	}
+
+	emmc_wr(MSDC_DMA_SA_HIGH, (uint32_t)(emmc_dma_pa >> 32) & 0xfu);
+	emmc_wr(MSDC_DMA_SA, (uint32_t)emmc_dma_pa);
+	emmc_wr(MSDC_DMA_LEN, len);
+	uint32_t ctrl = MSDC_DMA_CTRL_LASTBUF | (MSDC_DMA_BURST_64B << 12);
+	emmc_wr(MSDC_DMA_CTRL, ctrl);
+	__builtin_arm_dsb(0xf);
+	emmc_wr(MSDC_DMA_CTRL, ctrl | MSDC_DMA_CTRL_START);
+
+	if (!emmc_wait_int(INT_XFER_COMPL, INT_DATTMO | INT_DATCRCERR, write ? "dma write end" : "dma read end")) {
+		emmc_dma_stop_quiet();
+		if (blocks > 1u) {
+			(void)emmc_stop();
+		}
+		return false;
+	}
+	for (uint32_t i = 0; i < 1000000U && (emmc_rd(MSDC_DMA_CFG) & MSDC_DMA_CFG_STS); i++) {
+	}
+	if (emmc_rd(MSDC_DMA_CFG) & MSDC_DMA_CFG_STS) {
+		emmc_dma_stop_quiet();
+		if (blocks > 1u) {
+			(void)emmc_stop();
+		}
+		return emmc_fail("dma busy", emmc_rd(MSDC_DMA_CFG));
+	}
+	if (!write) {
+		__builtin_arm_dsb(0xf);
+		flush_dcache64((addr64_t)emmc_dma_pa, len, TRUE);
+		__builtin_arm_dsb(0xf);
+		memcpy(buf, (const void *)emmc_dma_va, len);
+	}
+	if (blocks > 1u && !emmc_stop()) {
+		return false;
+	}
+	if (write && !emmc_wait_card_ready()) {
+		return false;
+	}
+	emmc_dma_ops++;
+	return true;
+}
+
 static bool
 emmc_read_retrying(uint64_t lba, uint32_t blocks, uint32_t *dst)
 {
+	if (emmc_dma_ok && emmc_dma_xfer(lba, blocks, dst, false)) {
+		return true;
+	}
+	if (emmc_dma_ok) {
+		emmc_dma_errs++;
+		printf("emmc: DMA read %u blocks @ %llu failed (#%u after %llu ops: %s %#x); falling back to PIO\n",
+		    blocks, lba, emmc_dma_errs, emmc_dma_ops, emmc_failed ? emmc_failed : "?", emmc_failed_status);
+		if (emmc_dma_errs >= 3u) {
+			emmc_dma_ok = false;
+			printf("emmc: disabling DMA after %u errors\n", emmc_dma_errs);
+		}
+		emmc_pio_mode();
+		(void)emmc_stop();
+	}
 	if (emmc_read_blocks(lba, blocks, dst)) {
 		return true;
 	}
@@ -255,6 +378,21 @@ emmc_write_blocks(uint64_t lba, uint32_t blocks, const uint32_t *src)
 	if (!emmc_writable || emmc_lba == 0 || lba < emmc_lba ||
 	    blocks == 0 || blocks > emmc_blocks || (lba - emmc_lba) > (emmc_blocks - blocks)) {
 		return emmc_fail("write out of partition bounds", (uint32_t)lba);
+	}
+	if (emmc_dma_ok) {
+		if (emmc_dma_xfer(lba, blocks, (void *)(uintptr_t)src, true)) {
+			return true;
+		}
+		emmc_dma_errs++;
+		printf("emmc: DMA write %u blocks @ %llu failed (#%u: %s %#x); falling back to PIO\n",
+		    blocks, lba, emmc_dma_errs, emmc_failed ? emmc_failed : "?", emmc_failed_status);
+		if (emmc_dma_errs >= 3u) {
+			emmc_dma_ok = false;
+			printf("emmc: disabling DMA after %u errors\n", emmc_dma_errs);
+		}
+		emmc_pio_mode();
+		(void)emmc_stop();
+		(void)emmc_wait_card_ready();
 	}
 	if (!emmc_wait_idle()) {
 		return false;
@@ -666,12 +804,45 @@ mtk_emmc_init(void)
 	PE_parse_boot_argn("mp_rootrw", &rw, sizeof(rw));
 	emmc_writable = (rw != 0);
 
+	uint32_t want_dma = 1;
+	PE_parse_boot_argn("a32_emmc_dma", &want_dma, sizeof(want_dma));
+	if (want_dma != 0 && emmc_dma_va == 0) {
+		ppnum_t max_pnum = (ppnum_t)(atop_64(1ULL << 32) - 1);
+		if (kmem_alloc_contig(kernel_map, &emmc_dma_va, EMMC_DMA_SIZE, PAGE_MASK, max_pnum, 0,
+		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
+			ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)emmc_dma_va);
+			if (pn != 0) {
+				emmc_dma_pa = ptoa_64(pn);
+			} else {
+				emmc_dma_va = 0;
+			}
+		} else {
+			printf("emmc: failed to allocate 128 KiB DMA bounce buffer; staying on PIO\n");
+		}
+	}
+
 	lck_mtx_lock(&mtk_emmc_lock);
 	uint64_t first = 0, nblocks = 0;
 	if (!emmc_lookup_part_locked(want, &first, &nblocks)) {
 		lck_mtx_unlock(&mtk_emmc_lock);
 		printf("emmc: GPT partition '%s' not found on MSDC0\n", want);
 		return ENOENT;
+	}
+	if (want_dma != 0 && emmc_dma_va != 0 && emmc_dma_pa != 0) {
+		static uint32_t pio_ref[4 * 128] __attribute__((aligned(16)));
+		static uint32_t dma_ref[4 * 128] __attribute__((aligned(16)));
+		if (emmc_read_blocks(0ULL, 4u, pio_ref) &&
+		    emmc_dma_xfer(0ULL, 4u, dma_ref, false) &&
+		    memcmp(pio_ref, dma_ref, sizeof(pio_ref)) == 0) {
+			emmc_dma_ok = true;
+			printf("emmc: MSDC0 Basic DMA enabled (128 KiB bounce @ 0x%llx, verified 4-blk LBA 0)\n",
+			    emmc_dma_pa);
+		} else {
+			printf("emmc: MSDC0 Basic DMA self-test failed (%s %#x); staying on PIO\n",
+			    emmc_failed ? emmc_failed : "mismatch", emmc_failed_status);
+			emmc_pio_mode();
+			(void)emmc_stop();
+		}
 	}
 	emmc_lba = first;
 	emmc_part_blocks = nblocks;
