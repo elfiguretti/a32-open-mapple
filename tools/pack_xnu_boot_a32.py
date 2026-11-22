@@ -45,7 +45,9 @@ def main():
 
     off = page + pages(ksize) + pages(rsize) + pages(ssize) + pages(rdo_size)
     dtb = d[off : off + dtb_size]
-    assert len(dtb) == dtb_size and dtb[:4] == b"\xd0\x0d\xfe\xed", "failed to extract valid FDT from stock-boot"
+    assert len(dtb) == dtb_size and dtb[:4] in (b"\xd0\x0d\xfe\xed", b"\xd7\xb7\xab\x1e"), (
+        f"failed to extract valid FDT/DT_TABLE from stock-boot (got {dtb[:4].hex()})"
+    )
 
     shim_raw = Path(args.shim).read_bytes()
     assert shim_raw[0x38:0x3C] == b"ARM\x64", "shim is not a valid arm64 Image"

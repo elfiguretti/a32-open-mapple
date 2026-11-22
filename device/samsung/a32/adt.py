@@ -2,9 +2,9 @@
 # (paired with tools/soc/mt6768.py). All physical addresses verified from SM-A325M live.dtb and iomem.txt.
 
 # 4 GB RAM (0x40000000-0x13fffffff). Samsung reserves RKP/RKP_NS/KASLR at 0xd0000000-0xd1401000 and
-# dramc-rk1 at 0x13ffff000, leaving a clean 1740 MiB contiguous top bank for XNU (16 KiB page aligned,
-# ending on the 32 MiB boundary at 0x13e000000).
-RAM = (0xd1404000, 0x13e000000 - 0xd1404000)
+# dramc-rk1 at 0x13ffff000. XNU's 16 KiB bootstrap page tables in start.s use 32 MiB L2 blocks
+# (ARM_TT_L2_SIZE = 0x2000000), so phys_base MUST be 32 MiB aligned -> 0xd2000000..0x13e000000 (1728 MiB).
+RAM = (0xd2000000, 0x13e000000 - 0xd2000000)
 
 # LK's framebuffer: verified live by fbdiag_a32 (2026-11-21):
 # OVL0 L0 ADDR=0x7c720000, PITCH=0x1100 (4352 bytes = 1088*4, 64B-aligned!), SZ=1080x2400, s6e3fc3 AMOLED DSI CMD.

@@ -256,17 +256,40 @@ a32_ramoops_putc_raw(char ch)
 \th->size = sz;
 }
 
-void a32_dsi_cmd_flush_now(void);
+static inline uint64_t
+a32_cntpct_now(void)
+{
+\tuint64_t v;
+\t__asm__ volatile("mrs %0, cntpct_el0" : "=r"(v));
+\treturn v;
+}
+
+void a32_ramoops_putc_early(uint8_t ch);
 void
-a32_dsi_cmd_flush_now(void)
+a32_ramoops_putc_early(uint8_t ch)
+{
+\tif (a32_hw_ready) {
+\t\ta32_ramoops_putc_raw((char)ch);
+\t}
+}
+
+void a32_dsi_cmd_flush_mode(int force);
+void
+a32_dsi_cmd_flush_mode(int force)
 {
 \tif (!a32_hw_ready || a32_dsi0_va == 0 || a32_mutex_va == 0 || a32_ovl0_va == 0) {
 \t\treturn;
 \t}
 \t__asm__ volatile("dsb sy" ::: "memory");
-\tfor (uint32_t t = 0; t < 50000; t++) {
-\t\tif (!(a32_io_rd32(a32_dsi0_va, 0x004) & (1u << 31))) {
-\t\t\tbreak;
+\tif (a32_io_rd32(a32_dsi0_va, 0x004) & (1u << 31)) {
+\t\tif (!force) {
+\t\t\treturn; /* mid-frame: never tear the AMOLED panel */
+\t\t}
+\t\tuint64_t deadline = a32_cntpct_now() + 455000ULL; /* 35 ms @ 13 MHz */
+\t\twhile (a32_io_rd32(a32_dsi0_va, 0x004) & (1u << 31)) {
+\t\t\tif (a32_cntpct_now() >= deadline) {
+\t\t\t\tbreak;
+\t\t\t}
 \t\t}
 \t}
 \ta32_io_wr32(a32_ovl0_va, 0x02c, 1u);
@@ -277,6 +300,13 @@ a32_dsi_cmd_flush_now(void)
 \ta32_io_wr32(a32_dsi0_va, 0x000, 0u);
 \ta32_io_wr32(a32_dsi0_va, 0x000, 1u);
 \t__asm__ volatile("dsb sy" ::: "memory");
+}
+
+void a32_dsi_cmd_flush_now(void);
+void
+a32_dsi_cmd_flush_now(void)
+{
+\ta32_dsi_cmd_flush_mode(1);
 }
 
 void a32_console_hw_init(void);
@@ -324,24 +354,72 @@ mapple_log_append(const char *c, int size)
 \tfor (int i = 0; i < size; i++) {
 \t\tchar ch = c[i];
 \t\tmapple_log_ring[(at + (uint64_t)i) % MAPPLE_LOG_SIZE] = ch;
-\t\tif (a32_hw_ready) {
-\t\t\ta32_ramoops_putc_raw(ch);
-\t\t}
 \t\tif (ch == '\\n') {
 \t\t\tsaw_nl = 1;
 \t\t}
 \t}
 \tif (a32_hw_ready && saw_nl) {
 \t\t/* Rate-limit console AMOLED refreshes to ~25 Hz (13 MHz cntpct -> 520000 ticks ~ 40 ms) */
-\t\tuint64_t now;
-\t\t__asm__ volatile("mrs %0, cntpct_el0" : "=r"(now));
+\t\tuint64_t now = a32_cntpct_now();
 \t\tif (now - a32_last_flush_ticks >= 520000ULL) {
 \t\t\ta32_last_flush_ticks = now;
-\t\t\ta32_dsi_cmd_flush_now();
+\t\t\ta32_dsi_cmd_flush_mode(0);
 \t\t}
 \t}
 }"""
     replace_exact(p, old, new, "mtk_ufs.c: a32 ramoops + infracfg gates + DSI CMD live console")
+
+
+def patch_pe_serial(xnu: Path):
+    """Hook SM-A325M ramoops + AMOLED DSI CMD flush into early XNU fbcon (pe_serial.c)."""
+    p = xnu / "pexpert" / "arm" / "pe_serial.c"
+    old_init = """static void
+fbcon_init(void)
+{
+\tfbcon_cols = fbcon_width / (8 * FBCON_SCALE);
+\tfbcon_rows = fbcon_height / (16 * FBCON_SCALE);
+\tfbcon_col = fbcon_row = 0;
+\tfor (uint32_t r = 0; r < fbcon_rows; r++) {
+\t\tfbcon_clear_row(r);
+\t}
+}"""
+    new_init = """extern void a32_console_hw_init(void);
+extern void a32_ramoops_putc_early(uint8_t ch);
+extern void a32_dsi_cmd_flush_mode(int force);
+
+static void
+fbcon_init(void)
+{
+\tfbcon_cols = fbcon_width / (8 * FBCON_SCALE);
+\tfbcon_rows = fbcon_height / (16 * FBCON_SCALE);
+\tfbcon_col = fbcon_row = 0;
+\tfor (uint32_t r = 0; r < fbcon_rows; r++) {
+\t\tfbcon_clear_row(r);
+\t}
+\ta32_dsi_cmd_flush_mode(1);
+}"""
+    replace_exact(p, old_init, new_init, "pe_serial.c: flush AMOLED at end of fbcon_init()")
+
+    old_tx = """\tif (c == '\\n') {
+\t\tfbcon_newline();
+\t\treturn;
+\t}"""
+    new_tx = """\ta32_ramoops_putc_early(c);
+\tif (c == '\\n') {
+\t\tfbcon_newline();
+\t\ta32_dsi_cmd_flush_mode(panic_active() ? 1 : 0);
+\t\treturn;
+\t}"""
+    replace_exact(p, old_tx, new_tx, "pe_serial.c: mirror fbcon_transmit_data to ramoops + DSI CMD flush")
+
+    old_probe = """\tif (fbcon_base != NULL) {
+\t\tregister_serial_functions(&mapple_fbcon_serial_functions);
+\t}"""
+    new_probe = """\tif (fbcon_base != NULL) {
+\t\ta32_console_hw_init();
+\t\tregister_serial_functions(&mapple_fbcon_serial_functions);
+\t}"""
+    replace_exact(p, old_probe, new_probe, "pe_serial.c: call a32_console_hw_init() in fbcon_probe()")
 
 
 def patch_platform_expert(xnu: Path):
@@ -414,6 +492,7 @@ def main():
     copy_drivers(xnu)
     patch_build_lists(xnu)
     patch_mtk_ufs(xnu)
+    patch_pe_serial(xnu)
     patch_platform_expert(xnu)
     patch_framebuffer(xnu)
     print("Overlay applied cleanly!")

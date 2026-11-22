@@ -29,13 +29,27 @@ struct a32_ramoops_hdr {
 static inline void a32_wr32(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
 static inline uint32_t a32_rd32(uintptr_t a) { return *(volatile uint32_t *)a; }
 
+static inline uint64_t a32_cntpct(void)
+{
+	uint64_t v;
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(v));
+	return v;
+}
+
+static inline void a32_dsi_wait_idle(uint64_t max_ticks)
+{
+	uint64_t deadline = a32_cntpct() + max_ticks;
+	while (a32_rd32(A32_DSI0_STA) & (1u << 31)) {
+		if (a32_cntpct() >= deadline)
+			break;
+	}
+}
+
 static inline void a32_dsi_flush(void)
 {
 	__asm__ volatile("dsb sy" ::: "memory");
-	for (uint32_t t = 0; t < 50000; t++) {
-		if (!(a32_rd32(A32_DSI0_STA) & (1u << 31)))
-			break;
-	}
+	/* 13 MHz timer: 455000 ticks = 35 ms (> 16.6 ms AMOLED frame period) */
+	a32_dsi_wait_idle(455000ULL);
 	a32_wr32(A32_OVL0_SRC_CON, 1u);
 	a32_wr32(A32_DSI0_INTSTA, 0u);
 	a32_wr32(A32_DSI0_CMDQ_DATA0, 0x002c3909u);
@@ -44,6 +58,7 @@ static inline void a32_dsi_flush(void)
 	a32_wr32(A32_DSI0_START, 0u);
 	a32_wr32(A32_DSI0_START, 1u);
 	__asm__ volatile("dsb sy" ::: "memory");
+	a32_dsi_wait_idle(455000ULL);
 }
 
 static inline void a32_plog_reset(void)
