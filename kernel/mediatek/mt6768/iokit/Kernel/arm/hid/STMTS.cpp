@@ -392,8 +392,14 @@ STMTS::handleEvent(const uint8_t *ev)
 	}
 	uint32_t rawX = ((uint32_t)ev[1] << 4) | (ev[3] >> 4);
 	uint32_t rawY = ((uint32_t)ev[2] << 4) | (ev[3] & 0x0fu);
-	int x = (int)(MIN(rawX, fMaxX - 1) * fPanelW / fMaxX);
-	int y = (int)(MIN(rawY, fMaxY - 1) * fPanelH / fMaxY);
+	if (rawX >= fMaxX) {
+		rawX = fMaxX - 1;
+	}
+	if (rawY >= fMaxY) {
+		rawY = fMaxY - 1;
+	}
+	int x = (int)(rawX * fPanelW / fMaxX);
+	int y = (int)(rawY * fPanelH / fMaxY);
 	bool down = state != STM_TCHSTA_LEAVE;
 	if (state != STM_TCHSTA_MOVE && fLogCount < 8) {
 		fLogCount++;
