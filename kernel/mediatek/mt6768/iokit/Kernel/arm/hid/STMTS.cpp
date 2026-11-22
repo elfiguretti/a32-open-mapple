@@ -18,7 +18,6 @@
  *       0x62 CLEAR_ALL_EVENT  (0 bytes)
  *       0x10 SENSE_ON         (0 bytes)
  *       0x60 READ_ONE_EVENT   (16 bytes in one I2C transaction)
- *       0x61 READ_ALL_EVENT   (16 bytes per remaining event in the FIFO)
  *   - Coordinate event layout (stm_ts_event_coordinate, 16 bytes):
  *       b[0]: eid[1:0] (0 = coordinate), tid[5:2] (0..9), tchsta[7:6] (1=ENTER, 2=MOVE, 3=LEAVE)
  *       b[1]: x[11:4]
@@ -47,7 +46,6 @@ extern "C" int mapple_gpio_get(uint32_t pin, int *high);
 #define STM_CMD_TOUCH_TYPE      0x30
 #define STM_CMD_OP_MODE         0x31
 #define STM_CMD_READ_ONE_EVENT  0x60
-#define STM_CMD_READ_ALL_EVENT  0x61
 #define STM_CMD_CLEAR_ALL_EVENT 0x62
 #define STM_CMD_SCAN_MODE       0xa0
 
@@ -154,23 +152,22 @@ STMTS::readCmd(uint8_t cmd, uint8_t *buf, uint32_t len)
 IOReturn
 STMTS::readBatch(uint8_t (&events)[STM_MAX_EVENTS_PER_IRQ][STM_EVENT_SIZE], uint32_t &count)
 {
-	count = 0;
-	IOReturn kr = readCmd(STM_CMD_READ_ONE_EVENT, events[0], STM_EVENT_SIZE);
-	if (kr != kIOReturnSuccess || events[0][0] == 0) {
-		return kr;
-	}
-	count = 1 + (events[0][7] & 0x1fu);
-	if (count > 1) {
-		kr = readCmd(STM_CMD_READ_ALL_EVENT, events[1], (count - 1) * STM_EVENT_SIZE);
-		if (kr == kIOReturnSuccess) {
-			for (uint32_t i = 1; i < count; i++) {
-				if (events[i][0] == 0) {
-					return kIOReturnIOError;
-				}
-			}
+	// Match HakiOS on the SM-A325F: consume one 16-byte FTS record per read.
+	for (count = 0; count < STM_MAX_EVENTS_PER_IRQ;) {
+		uint8_t *event = events[count];
+		IOReturn kr = readCmd(STM_CMD_READ_ONE_EVENT, event, STM_EVENT_SIZE);
+		if (kr != kIOReturnSuccess) {
+			return kr;
+		}
+		if (event[0] == 0) {
+			return count == 0 ? kIOReturnSuccess : kIOReturnIOError;
+		}
+		count++;
+		if ((event[7] & 0x1fu) == 0) {
+			break;
 		}
 	}
-	return kr;
+	return kIOReturnSuccess;
 }
 
 void
@@ -473,6 +470,11 @@ STMTS::handleEvent(const uint8_t *ev)
 	int x = (int)(rawX * fPanelW / fMaxX);
 	int y = (int)(rawY * fPanelH / fMaxY);
 	bool down = state != STM_TCHSTA_LEAVE;
+	// Some FTS release records omit the position.
+	if (!down && rawX == 0 && rawY == 0 && (fActiveMask & (1u << tid))) {
+		x = fLastX[tid];
+		y = fLastY[tid];
+	}
 	if (state != STM_TCHSTA_MOVE && fLogCount < 8) {
 		fLogCount++;
 		IOLog("TOUCH: FTS5CU56A %s tid=%u (%d,%d)\n", down ? "down" : "up", tid, x, y);
