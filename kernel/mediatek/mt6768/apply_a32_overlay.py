@@ -542,6 +542,7 @@ def patch_i2c_dma(xnu: Path):
         "\tIOMemoryMap            *fDmaMap;\n"
         "\tvolatile uint8_t       *fDmaBuf;\n"
         "\tuint64_t                fDmaPa;\n"
+        "\tbool                    fReportedDmaPoll;\n"
         "\tbool                    fTransferActive;\n};",
         "MTKIO.h: add APDMA fields to MTKI2C",
     )
@@ -550,9 +551,14 @@ def patch_i2c_dma(xnu: Path):
     replace_exact(
         c,
         '#include "MTKIO.h"',
-        '#include "MTKIO.h"\nextern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);\n'
+        '#include "MTKIO.h"\n#include <mach/mach_time.h>\n'
+        'extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);\n'
         'static constexpr uint32_t kA32ApdmaRxOffset = 64;\n'
-        'static constexpr uint32_t kA32ApdmaMaxRead = 512;',
+        'static constexpr uint32_t kA32ApdmaMaxRead = 512;\n'
+        'static constexpr uint32_t kA32ApdmaIntFlag = 0x00;\n'
+        'static constexpr uint32_t kA32ApdmaEnable = 0x08;\n'
+        'static constexpr uint32_t kA32ApdmaRxAddress = 0x20;\n'
+        'static constexpr uint32_t kA32ApdmaDone = 0x03;',
         "MTKIO.cpp: declare ml_io_map for APDMA",
     )
     replace_exact(
@@ -630,7 +636,8 @@ def patch_i2c_dma(xnu: Path):
         "\t\tcontrol |= CONTROL_DIR_CHANGE | CONTROL_RS;\n"
         "\t}\n"
         "\tif (useDma) {\n"
-        "\t\tcontrol |= 0x0004; /* I2C_CONTROL_DMA_EN */\n"
+        "\t\t/* MT6768 i2c-mtk.c enables DMA, DMA ACK and async handshaking together. */\n"
+        "\t\tcontrol |= (1u << 2) | (1u << 8) | (1u << 9);\n"
         "\t}\n"
         "\twr16(I2C_CONTROL, control);",
         "MTKIO.cpp: set I2C_CONTROL_DMA_EN for rlen > 8",
@@ -651,16 +658,16 @@ def patch_i2c_dma(xnu: Path):
         "\t\t\tfDmaBuf[kA32ApdmaRxOffset + i] = 0;\n"
         "\t\t}\n"
         "\t\tuint64_t rxPa = fDmaPa + kA32ApdmaRxOffset;\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x00) = 0; /* INT_FLAG */\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + kA32ApdmaIntFlag) = 0;\n"
         "\t\t*(volatile uint32_t *)(fDmaRegs + 0x18) = 0; /* CON = WRRD */\n"
         "\t\t*(volatile uint32_t *)(fDmaRegs + 0x1c) = (uint32_t)fDmaPa;\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x20) = (uint32_t)rxPa;\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + kA32ApdmaRxAddress) = (uint32_t)rxPa;\n"
         "\t\t*(volatile uint32_t *)(fDmaRegs + 0x54) = (uint32_t)(fDmaPa >> 32);\n"
         "\t\t*(volatile uint32_t *)(fDmaRegs + 0x58) = (uint32_t)(rxPa >> 32);\n"
         "\t\t*(volatile uint32_t *)(fDmaRegs + 0x24) = wlen;\n"
         "\t\t*(volatile uint32_t *)(fDmaRegs + 0x28) = rlen;\n"
         "\t\tOSMemoryBarrier();\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x08) = 1; /* DMA EN */\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + kA32ApdmaEnable) = 1;\n"
         "\t} else {\n"
         "\t\tfor (uint32_t i = 0; i < wlen; i++) {\n"
         "\t\t\t*(volatile uint8_t *)(fRegs + I2C_DATA_PORT) = wbuf[i];\n"
@@ -670,11 +677,57 @@ def patch_i2c_dma(xnu: Path):
     )
     replace_exact(
         c,
+        "\twhile (!fDone) {\n"
+        "\t\tif (fGate->commandSleep(&fDone, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {\n"
+        "\t\t\tbreak;\n"
+        "\t\t}\n"
+        "\t}",
+        "\twhile (!fDone) {\n"
+        "\t\tAbsoluteTime wake = deadline;\n"
+        "\t\tif (useDma) {\n"
+        "\t\t\tclock_interval_to_deadline(2, kMillisecondScale, &wake);\n"
+        "\t\t\tif (wake > deadline) {\n"
+        "\t\t\t\twake = deadline;\n"
+        "\t\t\t}\n"
+        "\t\t}\n"
+        "\t\tif (fGate->commandSleep(&fDone, wake, THREAD_UNINT) != THREAD_TIMED_OUT || fDone) {\n"
+        "\t\t\tcontinue;\n"
+        "\t\t}\n"
+        "\t\tif (useDma) {\n"
+        "\t\t\tuint16_t pending = rd16(I2C_INTR_STAT) & (INTR_TRANSAC_COMP | INTR_ERRORS);\n"
+        "\t\t\tif (pending != 0) {\n"
+        "\t\t\t\twr16(I2C_INTR_STAT, pending);\n"
+        "\t\t\t\tfIrqStat = pending;\n"
+        "\t\t\t\tfDone = true;\n"
+        "\t\t\t\tbreak;\n"
+        "\t\t\t}\n"
+        "\t\t\t/* On A32, a completed WRRD can leave START and INTR_STAT both zero. */\n"
+        "\t\t\tconst volatile uint32_t *dma = (const volatile uint32_t *)fDmaRegs;\n"
+        "\t\t\tuint32_t rxEnd = (uint32_t)(fDmaPa + kA32ApdmaRxOffset + rlen);\n"
+        "\t\t\tif (rd16(I2C_START) == 0 && dma[kA32ApdmaEnable / 4] == 0 &&\n"
+        "\t\t\t    (dma[kA32ApdmaIntFlag / 4] & kA32ApdmaDone) == kA32ApdmaDone &&\n"
+        "\t\t\t    dma[kA32ApdmaRxAddress / 4] == rxEnd) {\n"
+        "\t\t\t\tfDone = true;\n"
+        "\t\t\t\tif (!fReportedDmaPoll) {\n"
+        "\t\t\t\t\tfReportedDmaPoll = true;\n"
+        "\t\t\t\t\tIOLog(\"I2C: bus %u confirmed APDMA completion without MCU IRQ\\n\", fBusId);\n"
+        "\t\t\t\t}\n"
+        "\t\t\t\tbreak;\n"
+        "\t\t\t}\n"
+        "\t\t}\n"
+        "\t\tif (mach_absolute_time() >= deadline) {\n"
+        "\t\t\tbreak;\n"
+        "\t\t}\n"
+        "\t}",
+        "MTKIO.cpp: confirm completed APDMA transfers if the controller IRQ is missed",
+    )
+    replace_exact(
+        c,
         "\tfor (uint32_t i = 0; i < rlen; i++) {\n"
         "\t\trbuf[i] = *(volatile uint8_t *)(fRegs + I2C_DATA_PORT);\n"
         "\t}",
         "\tif (useDma) {\n"
-        "\t\tvolatile uint32_t *dmaEn = (volatile uint32_t *)(fDmaRegs + 0x08);\n"
+        "\t\tvolatile uint32_t *dmaEn = (volatile uint32_t *)(fDmaRegs + kA32ApdmaEnable);\n"
         "\t\tfor (unsigned int i = 0; i < 100 && *dmaEn != 0; i++) {\n"
         "\t\t\tIODelay(1);\n"
         "\t\t}\n"
