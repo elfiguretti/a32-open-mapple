@@ -60,7 +60,6 @@ public:
 	virtual void free(void) APPLE_KEXT_OVERRIDE;
 	virtual IOWorkLoop *getWorkLoop(void) const APPLE_KEXT_OVERRIDE;
 protected:
-	virtual OSString *getManufacturer() APPLE_KEXT_OVERRIDE { return OSString::withCString("STMicroelectronics"); }
 	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString("FTS5CU56A"); }
 private:
 	static void interruptOccurred(OSObject *owner, IOInterruptEventSource *src, int count);
