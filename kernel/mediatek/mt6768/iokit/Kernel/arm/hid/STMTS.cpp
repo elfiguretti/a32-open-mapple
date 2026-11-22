@@ -2,24 +2,19 @@
  * Samsung Galaxy A32 4G (SM-A325M, MT6769T): STMicroelectronics FTS5CU56A
  * touchscreen driver, subclass of MappleHIDTouch.
  *
- * Matches /arm-io/i2c6/touch ("stm,stm_ts"), published as a MappleDTNub child
- * of MTKI2C (bus 6 @ 0x1100d000, APDMA @ 0x11000600).
+ * Matches /arm-io/touch ("stm,stm_ts") published directly as an IOPlatformDevice
+ * under /arm-io (without MTKI2C/APDMA/EINT).
  *
- * Hardware and protocol (SM-A325M live DT and Samsung stm_core.c/stm_fn.c):
+ * Uses open-drain bit-bang I2C directly on GPIO89 (SCL) and GPIO90 (SDA) with
+ * IOCFG_0 pull-ups (verified on SM-A325F/SM-A325M):
  *   - Power rails:
- *       * tsp_avdd_ldo (3.0V): MT6358 VCAMA2 (ANA_CON0 0x1e0c = 0x0c00, CON0 0x1c88 bit 0 = 1)
- *       * tsp_io_ldo   (1.8V): GPIO 4 output HIGH (fixed_regulator@0)
- *   - I2C 7-bit address: 0x49 on bus 6 (400 kHz)
- *   - IRQ: EINT/GPIO 10, active low while the FIFO is non-empty
- *   - Flash-resident firmware (fts5cu56a_a32.bin, verified live: id=535448 fw=02.54.00.16)
- *   - Commands:
- *       0x22 READ_DEVICE_ID   (3 bytes -> 53 54 48)
- *       0x24 READ_FW_VERSION  (4 bytes -> 02 54 00 16)
- *       0x62 CLEAR_ALL_EVENT  (0 bytes)
- *       0x10 SENSE_ON         (0 bytes)
- *       0x60 READ_ONE_EVENT   (16 bytes in one I2C transaction)
- *   - Coordinate event layout (stm_ts_event_coordinate, 16 bytes):
- *       b[0]: eid[1:0] (0 = coordinate), tid[5:2] (0..9), tchsta[7:6] (1=ENTER, 2=MOVE, 3=LEAVE)
+ *       * tsp_avdd_ldo (3.0V): MT6358 VCAMA2 (ANA_CON0 0x1e0c = 0x0c00, OP_EN 0x1c8a = 1, CON0 0x1c88 = 1)
+ *       * tsp_io_ldo   (1.8V): GPIO 4 output HIGH
+ *   - I2C 7-bit address: 0x49 (~100 kHz bit-bang, repeated START for register reads)
+ *   - IRQ line: GPIO 10 (active low while FIFO is non-empty, checked via DIN)
+ *   - Flash-resident firmware (verified live: id=535448 fw=02.54.00.16)
+ *   - Coordinate event layout (stm_ts_event_coordinate, 16 bytes via 0x60):
+ *       b[0]: eid[1:0] (0 = coordinate, 1 = status), tid[5:2] (0..9), tchsta[7:6] (1=ENTER, 2=MOVE, 3=LEAVE)
  *       b[1]: x[11:4]
  *       b[2]: y[11:4]
  *       b[3]: x[3:0] in bits [7:4], y[3:0] in bits [3:0]
@@ -30,30 +25,46 @@
 #if defined(MT6781)
 #include <IOKit/IOLib.h>
 #include <IOKit/IOWorkLoop.h>
-#include <IOKit/IOInterruptEventSource.h>
-#include <IOKit/IOTimerEventSource.h>
+#include <kern/clock.h>
+#include <kern/thread.h>
+#include <mach/mach_time.h>
 #include <pexpert/pexpert.h>
 #include "MappleHIDTouch.h"
-#include "../MTKIO.h"
 
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern "C" int mtk_pwrap_write_regulator(uint32_t addr, uint32_t mask, uint32_t value);
-extern "C" int mapple_gpio_set(uint32_t pin, int high);
-extern "C" int mapple_gpio_get(uint32_t pin, int *high);
+extern "C" kern_return_t thread_terminate(thread_t thread);
+
+#define A32_GPIO_PHYS           0x10005000UL
+#define A32_IOCFG0_PHYS         0x10002000UL
+
+#define A32_TSP_IO_GPIO         4
+#define A32_TSP_IRQ_GPIO        10
+#define A32_PIN_SCL             89
+#define A32_PIN_SDA             90
+
+#define GPIO_DIR_SET(bank)      (0x004u + (bank) * 0x10u)
+#define GPIO_DIR_CLR(bank)      (0x008u + (bank) * 0x10u)
+#define GPIO_DOUT_SET(bank)     (0x104u + (bank) * 0x10u)
+#define GPIO_DOUT_CLR(bank)     (0x108u + (bank) * 0x10u)
+#define GPIO_DIN(bank)          (0x200u + (bank) * 0x10u)
+#define GPIO_MODE_REG(pin)      (0x300u + ((pin) / 8u) * 0x10u)
+
+#define IOCFG_PD                0x50u
+#define IOCFG_PU                0x60u
+#define IOCFG_BIT_SCL           23u
+#define IOCFG_BIT_SDA           25u
+
+#define MT6358_VCAMA2_CON0      0x1c88u
+#define MT6358_VCAMA2_OP_EN     0x1c8au
+#define MT6358_VCAMA2_ANA_CON0  0x1e0cu
 
 #define STM_CMD_SENSE_ON        0x10
 #define STM_CMD_READ_ID         0x22
+#define STM_CMD_READ_PANEL_INFO 0x23
 #define STM_CMD_READ_FW_VER     0x24
-#define STM_CMD_TOUCH_TYPE      0x30
-#define STM_CMD_OP_MODE         0x31
 #define STM_CMD_READ_ONE_EVENT  0x60
 #define STM_CMD_CLEAR_ALL_EVENT 0x62
-#define STM_CMD_SCAN_MODE       0xa0
-
-#define STM_TOUCH_TYPE_DEFAULT  0x61  /* Touch, palm and wet */
-#define STM_OP_MODE_NORMAL      0x00
-#define STM_SCAN_MODE_DEFAULT   0x01  /* Mutual and self sensing */
-#define STM_ECHO_EVENT          0x43
-#define STM_ECHO_STATUS         0x01
 
 #define STM_EVENT_SIZE          16
 #define STM_EID_COORDINATE      0x00
@@ -69,14 +80,7 @@ extern "C" int mapple_gpio_get(uint32_t pin, int *high);
 #define STM_TCHSTA_LEAVE        3
 
 #define STM_MAX_FINGERS         MAPPLE_TOUCH_FINGERS
-#define STM_MAX_EVENTS_PER_IRQ  32
-#define STM_FIFO_WATCH_MS       80
-
-/* SM-A325M touch power rails (verified from live.dts + mt6358-regulator.c) */
-#define A32_TSP_IO_GPIO         4
-#define A32_TSP_IRQ_GPIO        10
-#define MT6358_VCAMA2_ANA_CON0  0x1e0c
-#define MT6358_LDO_VCAMA2_CON0  0x1c88
+#define STM_MAX_DRAIN           16u
 
 class STMTS : public MappleHIDTouch {
 	OSDeclareDefaultStructors(STMTS);
@@ -87,34 +91,69 @@ public:
 protected:
 	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString("FTS5CU56A"); }
 private:
-	enum class ReadMode { Interrupt, Watch };
-	static void interruptOccurred(OSObject *owner, IOInterruptEventSource *src, int count);
-	static void retryInterrupt(OSObject *owner, IOTimerEventSource *timer);
-	static void watchActiveContacts(OSObject *owner, IOTimerEventSource *timer);
+	static void pollThreadEntry(void *param, wait_result_t wr);
+
+	inline uint32_t rd(vm_offset_t base, uint32_t off) const
+	{
+		return *(volatile uint32_t *)(base + off);
+	}
+	inline void wr(vm_offset_t base, uint32_t off, uint32_t v) const
+	{
+		*(volatile uint32_t *)(base + off) = v;
+		__asm__ volatile("dsb sy" ::: "memory");
+	}
+	inline void pinLow(uint32_t pin) const
+	{
+		uint32_t bank = pin / 32u, bit = 1u << (pin % 32u);
+		wr(fGpio, GPIO_DOUT_CLR(bank), bit);
+		wr(fGpio, GPIO_DIR_SET(bank), bit);
+	}
+	inline void pinRelease(uint32_t pin) const
+	{
+		uint32_t bank = pin / 32u, bit = 1u << (pin % 32u);
+		wr(fGpio, GPIO_DOUT_SET(bank), bit);
+		wr(fGpio, GPIO_DIR_CLR(bank), bit);
+	}
+	inline bool pinValue(uint32_t pin) const
+	{
+		return (rd(fGpio, GPIO_DIN(pin / 32u)) & (1u << (pin % 32u))) != 0;
+	}
+	inline void i2cHalf(void) const
+	{
+		IODelay(4);
+	}
+
+	void pinsToGpio(void);
 	void powerOn(void);
-	bool startScanning(void);
-	void readEvents(ReadMode mode);
+	void i2cStart(void);
+	void i2cStop(void);
+	void i2cRecover(void);
+	bool i2cWriteByte(uint8_t value);
+	uint8_t i2cReadByte(bool ack);
+	bool ftsReadOnce(uint8_t cmd, uint8_t *buf, uint32_t len);
+	bool ftsWriteOnce(uint8_t cmd, const uint8_t *buf, uint32_t len);
+	bool ftsRead(uint8_t cmd, uint8_t *buf, uint32_t len);
+	bool ftsWrite(uint8_t cmd, const uint8_t *buf, uint32_t len);
 	void handleEvent(const uint8_t *ev);
 	void releaseContact(uint8_t id);
 	void releaseAll(void);
-	bool sendCmd(const uint8_t *cmd, uint32_t len);
-	IOReturn readCmd(uint8_t cmd, uint8_t *buf, uint32_t len);
-	IOReturn readBatch(uint8_t (&events)[STM_MAX_EVENTS_PER_IRQ][STM_EVENT_SIZE], uint32_t &count);
+	void pollLoop(void);
 
-	MTKI2C *fBus;
 	IOWorkLoop *fWorkLoop;
-	IOInterruptEventSource *fInterrupt;
-	IOTimerEventSource *fRetryTimer;
-	IOTimerEventSource *fWatchTimer;
+	vm_offset_t fGpio;
+	vm_offset_t fIocfg;
 	uint8_t fAddr;
 	uint32_t fMaxX, fMaxY;
 	uint32_t fPanelW, fPanelH;
 	uint32_t fActiveMask;
 	int fLastX[STM_MAX_FINGERS];
 	int fLastY[STM_MAX_FINGERS];
+	uint32_t fEvents;
+	uint32_t fReads;
 	uint32_t fErrors;
 	uint32_t fLogCount;
-	bool fSawInterrupt;
+	volatile bool fStop;
+	volatile bool fPollDone;
 };
 
 OSDefineMetaClassAndStructors(STMTS, MappleHIDTouch);
@@ -132,56 +171,46 @@ STMTS::getWorkLoop(void) const
 	return fWorkLoop;
 }
 
-bool
-STMTS::sendCmd(const uint8_t *cmd, uint32_t len)
+void
+STMTS::pinsToGpio(void)
 {
-	IOReturn kr = kIOReturnIOError;
-	// A write can finish without an MCU completion IRQ. These setup commands
-	// can be repeated, so retry them before abandoning the controller probe.
-	for (int attempt = 0; attempt < 3; attempt++) {
-		if (attempt != 0) {
-			IOSleep(5);
-		}
-		kr = fBus->transfer(fAddr, cmd, len, NULL, 0);
-		if (kr == kIOReturnSuccess) {
-			return true;
-		}
-	}
-	IOLog("TOUCH: FTS5CU56A command 0x%02x failed (0x%x)\n", cmd[0], kr);
-	return false;
-}
+	/* 1.8V I/O rail on GPIO4: level HIGH before direction output, function 0. */
+	uint32_t ioBit = 1u << (A32_TSP_IO_GPIO % 32u);
+	wr(fGpio, GPIO_DOUT_SET(A32_TSP_IO_GPIO / 32u), ioBit);
+	wr(fGpio, GPIO_DIR_SET(A32_TSP_IO_GPIO / 32u), ioBit);
+	uint32_t mode = rd(fGpio, GPIO_MODE_REG(A32_TSP_IO_GPIO));
+	mode &= ~(0xfu << ((A32_TSP_IO_GPIO % 8u) * 4u));
+	wr(fGpio, GPIO_MODE_REG(A32_TSP_IO_GPIO), mode);
 
-IOReturn
-STMTS::readCmd(uint8_t cmd, uint8_t *buf, uint32_t len)
-{
-	return fBus->transfer(fAddr, &cmd, 1, buf, len);
-}
+	/* Ensure IRQ GPIO10 is input, function 0. */
+	uint32_t irqBit = 1u << (A32_TSP_IRQ_GPIO % 32u);
+	wr(fGpio, GPIO_DIR_CLR(A32_TSP_IRQ_GPIO / 32u), irqBit);
+	mode = rd(fGpio, GPIO_MODE_REG(A32_TSP_IRQ_GPIO));
+	mode &= ~(0xfu << ((A32_TSP_IRQ_GPIO % 8u) * 4u));
+	wr(fGpio, GPIO_MODE_REG(A32_TSP_IRQ_GPIO), mode);
 
-IOReturn
-STMTS::readBatch(uint8_t (&events)[STM_MAX_EVENTS_PER_IRQ][STM_EVENT_SIZE], uint32_t &count)
-{
-	// Match HakiOS on the SM-A325F: consume one 16-byte FTS record per read.
-	for (count = 0; count < STM_MAX_EVENTS_PER_IRQ;) {
-		uint8_t *event = events[count];
-		IOReturn kr = readCmd(STM_CMD_READ_ONE_EVENT, event, STM_EVENT_SIZE);
-		if (kr != kIOReturnSuccess) {
-			return kr;
-		}
-		if (event[0] == 0) {
-			return count == 0 ? kIOReturnSuccess : kIOReturnIOError;
-		}
-		count++;
-		if ((event[7] & 0x1fu) == 0) {
-			break;
-		}
-	}
-	return kIOReturnSuccess;
+	/* GPIO89 (SCL) and GPIO90 (SDA) to GPIO function 0 with open-drain pull-ups. */
+	mode = rd(fGpio, GPIO_MODE_REG(A32_PIN_SCL));
+	mode &= ~(0xfu << ((A32_PIN_SCL % 8u) * 4u));
+	mode &= ~(0xfu << ((A32_PIN_SDA % 8u) * 4u));
+	wr(fGpio, GPIO_MODE_REG(A32_PIN_SCL), mode);
+
+	uint32_t pd = rd(fIocfg, IOCFG_PD);
+	pd &= ~((1u << IOCFG_BIT_SCL) | (1u << IOCFG_BIT_SDA));
+	wr(fIocfg, IOCFG_PD, pd);
+
+	uint32_t pu = rd(fIocfg, IOCFG_PU);
+	pu |= (1u << IOCFG_BIT_SCL) | (1u << IOCFG_BIT_SDA);
+	wr(fIocfg, IOCFG_PU, pu);
+
+	pinRelease(A32_PIN_SCL);
+	pinRelease(A32_PIN_SDA);
 }
 
 void
 STMTS::powerOn(void)
 {
-	/* 1) Enable 3.0V AVDD on MT6358 VCAMA2 (wait up to 5 s if MTKPwrap is still attaching) */
+	/* Enable 3.0V AVDD on MT6358 VCAMA2 (wait up to 5 s if MTKPwrap is still attaching). */
 	int prc = -1;
 	for (int i = 0; i < 100; i++) {
 		prc = mtk_pwrap_write_regulator(MT6358_VCAMA2_ANA_CON0, 0x0f00, 0x0c00);
@@ -191,64 +220,170 @@ STMTS::powerOn(void)
 		IOSleep(50);
 	}
 	if (prc == 0) {
-		(void)mtk_pwrap_write_regulator(MT6358_LDO_VCAMA2_CON0, 0x0001, 0x0001);
+		(void)mtk_pwrap_write_regulator(MT6358_VCAMA2_OP_EN, 0x0001, 0x0001);
+		(void)mtk_pwrap_write_regulator(MT6358_VCAMA2_CON0, 0x0001, 0x0001);
 	} else {
 		IOLog("TOUCH: FTS5CU56A VCAMA2 power-on failed (%d)\n", prc);
 	}
 
-	/* 2) Enable 1.8V I/O LDO on GPIO 4 (wait for MTKGPIO if needed) */
-	(void)MTKGPIO::wait();
-	int grc = mapple_gpio_set(A32_TSP_IO_GPIO, 1);
-	if (grc != 0) {
-		IOLog("TOUCH: FTS5CU56A GPIO %u power-on failed (%d)\n", A32_TSP_IO_GPIO, grc);
-	}
+	/* Allow FTS5CU56A internal MCU to boot its flash firmware. */
+	IOSleep(50);
+}
 
-	/* Allow FTS5CU56A internal MCU to boot its flash firmware */
-	IOSleep(100);
+void
+STMTS::i2cStart(void)
+{
+	pinRelease(A32_PIN_SDA);
+	pinRelease(A32_PIN_SCL);
+	i2cHalf();
+	pinLow(A32_PIN_SDA);
+	i2cHalf();
+	pinLow(A32_PIN_SCL);
+	i2cHalf();
+}
+
+void
+STMTS::i2cStop(void)
+{
+	pinLow(A32_PIN_SDA);
+	i2cHalf();
+	pinRelease(A32_PIN_SCL);
+	i2cHalf();
+	pinRelease(A32_PIN_SDA);
+	i2cHalf();
+}
+
+void
+STMTS::i2cRecover(void)
+{
+	pinRelease(A32_PIN_SDA);
+	for (unsigned i = 0; i < 9; i++) {
+		pinRelease(A32_PIN_SCL);
+		i2cHalf();
+		pinLow(A32_PIN_SCL);
+		i2cHalf();
+	}
+	i2cStop();
 }
 
 bool
-STMTS::startScanning(void)
+STMTS::i2cWriteByte(uint8_t value)
 {
-	const uint8_t clear[] = { STM_CMD_CLEAR_ALL_EVENT };
-	const uint8_t normal[] = { STM_CMD_OP_MODE, STM_OP_MODE_NORMAL };
-	const uint8_t touchType[] = { STM_CMD_TOUCH_TYPE, STM_TOUCH_TYPE_DEFAULT, 0 };
-	const uint8_t senseOn[] = { STM_CMD_SENSE_ON };
-	const uint8_t scan[] = { STM_CMD_SCAN_MODE, 0, STM_SCAN_MODE_DEFAULT };
-	if (!sendCmd(clear, sizeof(clear)) || !sendCmd(normal, sizeof(normal))) {
-		return false;
+	for (unsigned i = 0; i < 8; i++) {
+		if (value & 0x80u) {
+			pinRelease(A32_PIN_SDA);
+		} else {
+			pinLow(A32_PIN_SDA);
+		}
+		i2cHalf();
+		pinRelease(A32_PIN_SCL);
+		i2cHalf();
+		pinLow(A32_PIN_SCL);
+		i2cHalf();
+		value <<= 1;
 	}
-	IOSleep(5);
-	if (!sendCmd(touchType, sizeof(touchType))) {
-		return false;
-	}
-	IOSleep(10);
-	if (!sendCmd(senseOn, sizeof(senseOn)) || !sendCmd(scan, sizeof(scan))) {
-		return false;
-	}
-	IOSleep(20);
+	pinRelease(A32_PIN_SDA);
+	i2cHalf();
+	pinRelease(A32_PIN_SCL);
+	i2cHalf();
+	bool ack = !pinValue(A32_PIN_SDA);
+	pinLow(A32_PIN_SCL);
+	i2cHalf();
+	return ack;
+}
 
-	// Consume the command echoes before arming EINT10.
-	uint8_t events[STM_MAX_EVENTS_PER_IRQ][STM_EVENT_SIZE];
-	for (int attempt = 0; attempt < 12; attempt++) {
-		uint32_t count;
-		IOReturn kr = readBatch(events, count);
-		if (kr != kIOReturnSuccess) {
-			IOLog("TOUCH: FTS5CU56A scan echo read failed (0x%x)\n", kr);
-			break;
-		}
-		for (uint32_t i = 0; i < count; i++) {
-			const uint8_t *ev = events[i];
-			if (ev[0] == STM_ECHO_EVENT && ev[1] == STM_ECHO_STATUS &&
-			    ev[2] == scan[0] && ev[3] == scan[1] && ev[4] == scan[2]) {
-				IOLog("TOUCH: FTS5CU56A scan mode acknowledged\n");
-				return true;
-			}
-		}
-		IOSleep(5);
+uint8_t
+STMTS::i2cReadByte(bool ack)
+{
+	uint8_t value = 0;
+	pinRelease(A32_PIN_SDA);
+	for (unsigned i = 0; i < 8; i++) {
+		i2cHalf();
+		pinRelease(A32_PIN_SCL);
+		i2cHalf();
+		value = (uint8_t)((value << 1) | (pinValue(A32_PIN_SDA) ? 1u : 0u));
+		pinLow(A32_PIN_SCL);
+		i2cHalf();
 	}
-	IOLog("TOUCH: FTS5CU56A scan mode echo missing\n");
+	if (ack) {
+		pinLow(A32_PIN_SDA);
+	} else {
+		pinRelease(A32_PIN_SDA);
+	}
+	i2cHalf();
+	pinRelease(A32_PIN_SCL);
+	i2cHalf();
+	pinLow(A32_PIN_SCL);
+	i2cHalf();
+	pinRelease(A32_PIN_SDA);
+	return value;
+}
+
+bool
+STMTS::ftsReadOnce(uint8_t cmd, uint8_t *buf, uint32_t len)
+{
+	uint8_t wrAddr = (uint8_t)(fAddr << 1);
+	uint8_t rdAddr = (uint8_t)(wrAddr | 1u);
+
+	i2cStart();
+	if (!i2cWriteByte(wrAddr) || !i2cWriteByte(cmd)) {
+		i2cStop();
+		return false;
+	}
+	i2cStart();
+	if (!i2cWriteByte(rdAddr)) {
+		i2cStop();
+		return false;
+	}
+	for (uint32_t i = 0; i < len; i++) {
+		buf[i] = i2cReadByte(i + 1 < len);
+	}
+	i2cStop();
 	return true;
+}
+
+bool
+STMTS::ftsWriteOnce(uint8_t cmd, const uint8_t *buf, uint32_t len)
+{
+	uint8_t wrAddr = (uint8_t)(fAddr << 1);
+
+	i2cStart();
+	if (!i2cWriteByte(wrAddr) || !i2cWriteByte(cmd)) {
+		i2cStop();
+		return false;
+	}
+	for (uint32_t i = 0; i < len; i++) {
+		if (!i2cWriteByte(buf[i])) {
+			i2cStop();
+			return false;
+		}
+	}
+	i2cStop();
+	return true;
+}
+
+bool
+STMTS::ftsRead(uint8_t cmd, uint8_t *buf, uint32_t len)
+{
+	for (int attempt = 0; attempt < 3; attempt++) {
+		if (ftsReadOnce(cmd, buf, len)) {
+			return true;
+		}
+		i2cRecover();
+	}
+	return false;
+}
+
+bool
+STMTS::ftsWrite(uint8_t cmd, const uint8_t *buf, uint32_t len)
+{
+	for (int attempt = 0; attempt < 3; attempt++) {
+		if (ftsWriteOnce(cmd, buf, len)) {
+			return true;
+		}
+		i2cRecover();
+	}
+	return false;
 }
 
 bool
@@ -260,11 +395,11 @@ STMTS::start(IOService *provider)
 		IOLog("TOUCH: FTS5CU56A disabled by mp_touch=0\n");
 		return false;
 	}
-	fBus = OSDynamicCast(MTKI2C, provider->getProvider());
+
 	fWorkLoop = IOWorkLoop::workLoop();
 	fAddr = (uint8_t)stmDtU32(provider, "i2c-address", 0x49);
-	fMaxX = stmDtU32(provider, "max-x", 4096);
-	fMaxY = stmDtU32(provider, "max-y", 4096);
+	fMaxX = stmDtU32(provider, "max-x", 4095);
+	fMaxY = stmDtU32(provider, "max-y", 4095);
 	fPanelW = 1080;
 	fPanelH = 2400;
 	OSData *ps = OSDynamicCast(OSData, provider->getProperty("panel-size"));
@@ -275,104 +410,96 @@ STMTS::start(IOService *provider)
 			fPanelH = dims[1];
 		}
 	}
-	if (fBus == NULL || fWorkLoop == NULL || fMaxX == 0 || fMaxY == 0) {
-		IOLog("TOUCH: STMTS missing I2C bus, work loop, or bounds\n");
+	fGpio = ml_io_map(A32_GPIO_PHYS, 0x1000);
+	fIocfg = ml_io_map(A32_IOCFG0_PHYS, 0x1000);
+	if (fWorkLoop == NULL || fGpio == 0 || fIocfg == 0 || fMaxX == 0 || fMaxY == 0) {
+		IOLog("TOUCH: STMTS missing work loop, MMIO map, or bounds\n");
 		return false;
 	}
 
+	pinsToGpio();
+	IOSleep(2);
 	powerOn();
 
-	uint8_t id[3] = { 0 };
-	uint8_t fw[4] = { 0 };
-	IOReturn kr = kIOReturnIOError;
+	IOLog("TOUCH: FTS5CU56A pins mode11=%08x pu=%08x pd=%08x idle scl=%d sda=%d irq=%d\n",
+	    rd(fGpio, GPIO_MODE_REG(A32_PIN_SCL)), rd(fIocfg, IOCFG_PU), rd(fIocfg, IOCFG_PD),
+	    pinValue(A32_PIN_SCL) ? 1 : 0, pinValue(A32_PIN_SDA) ? 1 : 0, pinValue(A32_TSP_IRQ_GPIO) ? 1 : 0);
+
+	i2cRecover();
+
+	uint8_t id[5] = { 0 };
+	bool idOk = false;
 	for (int attempt = 0; attempt < 5; attempt++) {
-		kr = readCmd(STM_CMD_READ_ID, id, sizeof(id));
-		if (kr == kIOReturnSuccess && id[0] == 0x53 && id[1] == 0x54 && id[2] == 0x48) {
+		if (ftsRead(STM_CMD_READ_ID, id, sizeof(id)) && id[0] == 0x53 && id[1] == 0x54 && id[2] == 0x48) {
+			idOk = true;
 			break;
 		}
 		IOSleep(30);
 	}
-	if (kr != kIOReturnSuccess || id[0] != 0x53 || id[1] != 0x54 || id[2] != 0x48) {
-		IOLog("TOUCH: FTS5CU56A at 0x%02x probe failed (kr=0x%x id=%02x%02x%02x)\n",
-		    fAddr, kr, id[0], id[1], id[2]);
+	if (!idOk) {
+		IOLog("TOUCH: FTS5CU56A at 0x%02x probe failed (id=%02x%02x%02x)\n",
+		    fAddr, id[0], id[1], id[2]);
 		return false;
 	}
-	(void)readCmd(STM_CMD_READ_FW_VER, fw, sizeof(fw));
-	IOLog("TOUCH: FTS5CU56A at 0x%02x id=%02x%02x%02x fw=%02x.%02x.%02x.%02x\n",
-	    fAddr, id[0], id[1], id[2], fw[0], fw[1], fw[2], fw[3]);
 
-	if (!startScanning()) {
+	uint8_t fw[9] = { 0 };
+	(void)ftsRead(STM_CMD_READ_FW_VER, fw, sizeof(fw));
+	uint8_t panel[11] = { 0 };
+	if (ftsRead(STM_CMD_READ_PANEL_INFO, panel, sizeof(panel))) {
+		uint32_t rx = ((uint32_t)panel[0] << 8) | panel[1];
+		uint32_t ry = ((uint32_t)panel[2] << 8) | panel[3];
+		if (rx > 0 && rx < 0xffffu) {
+			fMaxX = rx;
+		}
+		if (ry > 0 && ry < 0xffffu) {
+			fMaxY = ry;
+		}
+		IOLog("TOUCH: FTS5CU56A at 0x%02x id=%02x%02x%02x fw=%02x.%02x.%02x.%02x panel=%ux%u\n",
+		    fAddr, id[0], id[1], id[2], fw[0], fw[1], fw[2], fw[3], rx, ry);
+	} else {
+		IOLog("TOUCH: FTS5CU56A at 0x%02x id=%02x%02x%02x fw=%02x.%02x.%02x.%02x\n",
+		    fAddr, id[0], id[1], id[2], fw[0], fw[1], fw[2], fw[3]);
+	}
+
+	if (!ftsWrite(STM_CMD_SENSE_ON, NULL, 0)) {
+		IOLog("TOUCH: FTS5CU56A SENSE_ON failed\n");
 		return false;
 	}
-	fInterrupt = IOInterruptEventSource::interruptEventSource(this, &STMTS::interruptOccurred, provider, 0);
-	fRetryTimer = IOTimerEventSource::timerEventSource(this, &STMTS::retryInterrupt);
-	fWatchTimer = IOTimerEventSource::timerEventSource(this, &STMTS::watchActiveContacts);
-	if (fInterrupt == NULL || fRetryTimer == NULL || fWatchTimer == NULL ||
-	    fWorkLoop->addEventSource(fInterrupt) != kIOReturnSuccess ||
-	    fWorkLoop->addEventSource(fRetryTimer) != kIOReturnSuccess ||
-	    fWorkLoop->addEventSource(fWatchTimer) != kIOReturnSuccess) {
-		IOLog("TOUCH: STMTS failed to attach EINT interrupt\n");
-		return false;
-	}
+	IOSleep(30);
+	(void)ftsWrite(STM_CMD_CLEAR_ALL_EVENT, NULL, 0);
+
 	if (!MappleHIDTouch::start(provider)) {
 		return false;
 	}
-	fInterrupt->enable();
-	IOLog("TOUCH: FTS5CU56A on, coords %ux%u -> panel %ux%u\n", fMaxX, fMaxY, fPanelW, fPanelH);
+
+	fStop = false;
+	fPollDone = false;
+	thread_t thread = NULL;
+	if (kernel_thread_start(&STMTS::pollThreadEntry, this, &thread) != KERN_SUCCESS) {
+		IOLog("TOUCH: STMTS failed to start polling thread\n");
+		return false;
+	}
+	thread_deallocate(thread);
+	IOLog("TOUCH: FTS5CU56A on (bit-bang GPIO%u/%u), coords %ux%u -> panel %ux%u\n",
+	    A32_PIN_SCL, A32_PIN_SDA, fMaxX, fMaxY, fPanelW, fPanelH);
 	return true;
 }
 
 void
 STMTS::free(void)
 {
-	if (fInterrupt != NULL) {
-		fInterrupt->disable();
-		fWorkLoop->removeEventSource(fInterrupt);
+	fStop = true;
+	for (int i = 0; i < 20 && !fPollDone; i++) {
+		IOSleep(5);
 	}
-	if (fRetryTimer != NULL) {
-		fRetryTimer->cancelTimeout();
-		fWorkLoop->removeEventSource(fRetryTimer);
-	}
-	if (fWatchTimer != NULL) {
-		fWatchTimer->cancelTimeout();
-		fWorkLoop->removeEventSource(fWatchTimer);
-	}
-	OSSafeReleaseNULL(fInterrupt);
-	OSSafeReleaseNULL(fRetryTimer);
-	OSSafeReleaseNULL(fWatchTimer);
 	MappleHIDTouch::free();
 	OSSafeReleaseNULL(fWorkLoop);
 }
 
 void
-STMTS::interruptOccurred(OSObject *owner, IOInterruptEventSource *src __unused, int count __unused)
+STMTS::pollThreadEntry(void *param, wait_result_t wr __unused)
 {
-	STMTS *self = static_cast<STMTS *>(owner);
-	if (!self->fSawInterrupt) {
-		self->fSawInterrupt = true;
-		IOLog("TOUCH: FTS5CU56A first EINT10 interrupt\n");
-	}
-	self->readEvents(ReadMode::Interrupt);
-}
-
-void
-STMTS::retryInterrupt(OSObject *owner, IOTimerEventSource *timer __unused)
-{
-	static_cast<STMTS *>(owner)->fInterrupt->enable();
-}
-
-void
-STMTS::watchActiveContacts(OSObject *owner, IOTimerEventSource *timer)
-{
-	STMTS *self = static_cast<STMTS *>(owner);
-	if (self->fActiveMask == 0) {
-		return;
-	}
-	// A quiet FTS FIFO does not tell us whether a stationary finger is still down.
-	self->readEvents(ReadMode::Watch);
-	if (self->fActiveMask != 0) {
-		timer->setTimeoutMS(STM_FIFO_WATCH_MS);
-	}
+	static_cast<STMTS *>(param)->pollLoop();
 }
 
 void
@@ -390,50 +517,70 @@ STMTS::releaseAll(void)
 			releaseContact(id);
 		}
 	}
-	fWatchTimer->cancelTimeout();
 }
 
 void
-STMTS::readEvents(ReadMode mode)
+STMTS::pollLoop(void)
 {
-	int irqLevel;
-	bool asserted = mode == ReadMode::Watch &&
-	    mapple_gpio_get(A32_TSP_IRQ_GPIO, &irqLevel) == 0 && irqLevel == 0;
-	uint8_t events[STM_MAX_EVENTS_PER_IRQ][STM_EVENT_SIZE];
-	uint32_t count;
-	IOReturn kr = readBatch(events, count);
-	if (kr != kIOReturnSuccess || count == 0) {
-		if (mode == ReadMode::Watch && (kr == kIOReturnSuccess || !asserted)) {
-			return;
-		}
-		if (++fErrors <= 8) {
-			IOLog("TOUCH: FTS5CU56A EINT10 %s (0x%x)\n",
-			    kr == kIOReturnSuccess ? "with empty FIFO" : "event read failed", kr);
-		}
-		if (kr != kIOReturnSuccess) {
-			releaseAll();
-		}
-		if (mode != ReadMode::Interrupt) {
-			return;
-		}
-		// EINT can report an empty FIFO between valid records. Once GPIO10 is
-		// high, the IRQ can be rearmed immediately and the contacts stay down.
-		if (kr == kIOReturnSuccess && mapple_gpio_get(A32_TSP_IRQ_GPIO, &irqLevel) == 0 && irqLevel != 0) {
-			return;
-		}
-		// Back off only a failed read or a line that is still asserted.
-		fInterrupt->disable();
-		fRetryTimer->setTimeoutMS(20);
-		return;
+	uint32_t pollUs = 4000;
+	uint32_t pollAll = 0;
+	(void)PE_parse_boot_argn("a32_touch_poll_us", &pollUs, sizeof(pollUs));
+	(void)PE_parse_boot_argn("a32_touch_poll_all", &pollAll, sizeof(pollAll));
+	if (pollUs < 1000u || pollUs > 50000u) {
+		pollUs = 4000u;
 	}
-	for (uint32_t i = 0; i < count; i++) {
-		handleEvent(events[i]);
+
+	uint32_t statsEvery = (60u * 1000000u) / pollUs;
+	if (statsEvery == 0) {
+		statsEvery = 1;
 	}
-	if (fActiveMask == 0) {
-		fWatchTimer->cancelTimeout();
-	} else if (mode != ReadMode::Watch) {
-		fWatchTimer->setTimeoutMS(STM_FIFO_WATCH_MS);
+	uint64_t lastReadNs = 0;
+	const uint64_t watchIntervalNs = 40ULL * NSEC_PER_MSEC;
+	uint32_t lastLoggedReads = 0;
+	uint32_t statsLogged = 0;
+
+	for (uint32_t tick = 0; !fStop; tick++) {
+		uint64_t nowNs = 0;
+		absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
+
+		bool irqAsserted = !pinValue(A32_TSP_IRQ_GPIO);
+		bool shouldRead = (pollAll != 0) || irqAsserted || (tick < 4u) ||
+		    (fActiveMask != 0 && (nowNs - lastReadNs) >= watchIntervalNs);
+
+		if (shouldRead) {
+			lastReadNs = nowNs;
+			uint8_t ev[STM_EVENT_SIZE];
+			for (uint32_t i = 0; i < STM_MAX_DRAIN; i++) {
+				if (!ftsRead(STM_CMD_READ_ONE_EVENT, ev, sizeof(ev))) {
+					if (++fErrors <= 8) {
+						IOLog("TOUCH: FTS5CU56A bit-bang read failed (errors=%u)\n", fErrors);
+					}
+					releaseAll();
+					break;
+				}
+				fReads++;
+				if (ev[0] == 0) {
+					break;
+				}
+				handleEvent(ev);
+				if ((ev[7] & 0x1fu) == 0) {
+					break;
+				}
+			}
+		}
+
+		if (tick != 0 && (tick % statsEvery) == 0 && (fReads != lastLoggedReads || statsLogged < 3u)) {
+			lastLoggedReads = fReads;
+			statsLogged++;
+			IOLog("TOUCH: FTS5CU56A stats events=%u reads=%u errors=%u active=0x%x\n",
+			    fEvents, fReads, fErrors, fActiveMask);
+		}
+
+		delay_for_interval(pollUs, NSEC_PER_USEC);
 	}
+
+	fPollDone = true;
+	thread_terminate(current_thread());
 }
 
 void
@@ -447,7 +594,9 @@ STMTS::handleEvent(const uint8_t *ev)
 		} else if (type == STM_STATUS_INFO && ev[1] == STM_INFO_READY && ev[2] == STM_READY_RESET) {
 			IOLog("TOUCH: FTS5CU56A reset, restarting scan\n");
 			releaseAll();
-			(void)startScanning();
+			(void)ftsWrite(STM_CMD_SENSE_ON, NULL, 0);
+			IOSleep(30);
+			(void)ftsWrite(STM_CMD_CLEAR_ALL_EVENT, NULL, 0);
 		}
 		return;
 	}
@@ -460,18 +609,31 @@ STMTS::handleEvent(const uint8_t *ev)
 	if (tid >= STM_MAX_FINGERS || state == 0) {
 		return;
 	}
+	fEvents++;
+
 	uint32_t rawX = ((uint32_t)ev[1] << 4) | (ev[3] >> 4);
 	uint32_t rawY = ((uint32_t)ev[2] << 4) | (ev[3] & 0x0fu);
-	if (rawX >= fMaxX) {
-		rawX = fMaxX - 1;
+	if (rawX > fMaxX) {
+		rawX = fMaxX;
 	}
-	if (rawY >= fMaxY) {
-		rawY = fMaxY - 1;
+	if (rawY > fMaxY) {
+		rawY = fMaxY;
 	}
-	int x = (int)(rawX * fPanelW / fMaxX);
-	int y = (int)(rawY * fPanelH / fMaxY);
+	int x = (int)((uint64_t)rawX * (fPanelW - 1) / fMaxX);
+	int y = (int)((uint64_t)rawY * (fPanelH - 1) / fMaxY);
+	if (x < 0) {
+		x = 0;
+	} else if (x >= (int)fPanelW) {
+		x = (int)fPanelW - 1;
+	}
+	if (y < 0) {
+		y = 0;
+	} else if (y >= (int)fPanelH) {
+		y = (int)fPanelH - 1;
+	}
+
 	bool down = state != STM_TCHSTA_LEAVE;
-	// Some FTS release records omit the position.
+	/* Some FTS release records omit the position. */
 	if (!down && rawX == 0 && rawY == 0 && (fActiveMask & (1u << tid))) {
 		x = fLastX[tid];
 		y = fLastY[tid];
@@ -480,7 +642,7 @@ STMTS::handleEvent(const uint8_t *ev)
 		fLogCount++;
 		IOLog("TOUCH: FTS5CU56A %s tid=%u (%d,%d)\n", down ? "down" : "up", tid, x, y);
 	}
-	// A second ENTER on the same slot starts a new contact after a lost LEAVE.
+	/* A second ENTER on the same slot starts a new contact after a lost LEAVE. */
 	if (state == STM_TCHSTA_ENTER && (fActiveMask & (1u << tid))) {
 		IOLog("TOUCH: FTS5CU56A restarting active contact %u\n", tid);
 		releaseContact(tid);

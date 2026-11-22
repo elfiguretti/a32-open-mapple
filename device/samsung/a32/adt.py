@@ -27,7 +27,6 @@ def devices(a, ph, phandle, gic_ph, ecid, flags):
     """
     node, cstr, u32, spi, io, wifi_mac = a.node, a.cstr, a.u32, a.spi, a.io, a.wifi_mac
     IRQ_EDGE_RISING, IRQ_LEVEL_HIGH = a.IRQ_EDGE_RISING, a.IRQ_LEVEL_HIGH
-    IRQ_LEVEL_LOW = 8  # Linux IRQ_TYPE_LEVEL_LOW, supported by MTKEINT
     HID_CSMR_POWER, HID_CSMR_VOLUME_UP, HID_CSMR_VOLUME_DOWN = a.HID_CSMR_POWER, a.HID_CSMR_VOLUME_UP, a.HID_CSMR_VOLUME_DOWN
     eint_ph = next(phandle)
 
@@ -74,33 +73,15 @@ def devices(a, ph, phandle, gic_ph, ecid, flags):
             ('reg', io(0x10005000, 0x1000)),
             ('output-pins', u32(4)),
         ]),
-        # I2C6 @ 0x1100d000 (SPI 0x94, i2c_common ver=2, ext_time_config=0x1801, clock-div=5,
-        # source-clock=univpll3_d4=124.8 MHz, APDMA @ 0x11000600 for 16-byte FTS5CU56A events).
-        node('i2c6', [
+        # STMicroelectronics FTS5CU56A touch (iokit/Kernel/arm/hid/STMTS.cpp):
+        # Direct GPIO89/90 open-drain bit-bang I2C @ 0x49, GPIO10 active-low IRQ, max_coords = 4095x4095.
+        node('touch', [
             ph(),
-            ('compatible', cstr('mediatek,mt6781-i2c')),
-            ('reg', io(0x1100d000, 0x1000)),
-            ('dma-base', u32(0x11000600)),
-            ('interrupt-parent', u32(gic_ph)),
-            ('interrupts', spi(0x94, IRQ_LEVEL_HIGH)),
-            ('bus-id', u32(6)),
-            ('clock-frequency', u32(400000)),
-            ('source-clock', u32(124800000)),
-            ('clock-div', u32(5)),
-            ('ext-time-config', u32(0x1801)),
-        ], [
-            # STMicroelectronics FTS5CU56A touch (iokit/Kernel/arm/hid/STMTS.cpp):
-            # I2C6 @ 0x49, IRQ EINT 10 (level low), sec,max_coords = 4096x4096.
-            node('touch', [
-                ph(),
-                ('compatible', cstr('stm,stm_ts')),
-                ('i2c-address', u32(0x49)),
-                ('interrupt-parent', u32(eint_ph)),
-                ('interrupts', u32(10, IRQ_LEVEL_LOW)),
-                ('max-x', u32(4096)),
-                ('max-y', u32(4096)),
-                ('panel-size', u32(FB['width'], FB['height'])),
-            ]),
+            ('compatible', cstr('stm,stm_ts')),
+            ('i2c-address', u32(0x49)),
+            ('max-x', u32(4095)),
+            ('max-y', u32(4095)),
+            ('panel-size', u32(FB['width'], FB['height'])),
         ]),
         # eMMC MSDC0 @ 0x11230000 (SPI 0x64), 128 GB SAMSUNG DV6DAB (bsd/dev/mtk_emmc.c).
         node('emmc', [

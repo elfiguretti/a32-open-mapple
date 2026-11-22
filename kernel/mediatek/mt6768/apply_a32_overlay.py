@@ -34,11 +34,14 @@ HERE = Path(__file__).resolve().parent
 
 def replace_exact(path: Path, old: str, new: str, label: str):
     txt = path.read_text(encoding="utf-8")
-    if new in txt:
+    if old not in txt:
+        if new == "" or new in txt:
+            print(f"  [already applied] {label}")
+            return
+        raise SystemExit(f"ERROR: target snippet not found for {label} in {path}")
+    if new and new not in old and new in txt:
         print(f"  [already applied] {label}")
         return
-    if old not in txt:
-        raise SystemExit(f"ERROR: target snippet not found for {label} in {path}")
     cnt = txt.count(old)
     if cnt != 1:
         raise SystemExit(f"ERROR: expected 1 match for {label} in {path}, found {cnt}")
@@ -49,6 +52,7 @@ def replace_exact(path: Path, old: str, new: str, label: str):
 def copy_drivers(xnu: Path):
     copies = [
         (HERE / "bsd" / "dev" / "mtk_emmc.c", xnu / "bsd" / "dev" / "mtk_emmc.c"),
+        (HERE / "bsd" / "dev" / "a32_cpufreq.c", xnu / "bsd" / "dev" / "a32_cpufreq.c"),
         (HERE / "iokit" / "Kernel" / "arm" / "hid" / "STMTS.cpp",
          xnu / "iokit" / "Kernel" / "arm" / "hid" / "STMTS.cpp"),
     ]
@@ -64,8 +68,8 @@ def patch_build_lists(xnu: Path):
     replace_exact(
         xnu / "bsd" / "conf" / "files",
         "bsd/dev/mtk_ufs.c\t\t\tstandard",
-        "bsd/dev/mtk_ufs.c\t\t\tstandard\nbsd/dev/mtk_emmc.c\t\t\tstandard",
-        "bsd/conf/files: add bsd/dev/mtk_emmc.c",
+        "bsd/dev/mtk_ufs.c\t\t\tstandard\nbsd/dev/mtk_emmc.c\t\t\tstandard\nbsd/dev/a32_cpufreq.c\t\t\tstandard",
+        "bsd/conf/files: add bsd/dev/mtk_emmc.c and bsd/dev/a32_cpufreq.c",
     )
     replace_exact(
         xnu / "iokit" / "conf" / "files.arm64",
@@ -88,10 +92,20 @@ def patch_build_lists(xnu: Path):
         '    "   },"\n'
         '    "   {"\n'
         '    "     \'IOClass\'         = STMTS;"\n'
-        '    "     \'IOProviderClass\' = MappleDTNub;"\n'
+        '    "     \'IOProviderClass\' = IOPlatformDevice;"\n'
         '    "     \'IONameMatch\'     = \'stm,stm_ts\';"\n'
         '    "   },"',
-        "iokit/KernelConfigTables.cpp: register STMTS (stm,stm_ts)",
+        "iokit/KernelConfigTables.cpp: register STMTS (IOPlatformDevice stm,stm_ts)",
+    )
+    replace_exact(
+        xnu / "iokit" / "KernelConfigTables.cpp",
+        '    "   {"\n'
+        '    "     \'IOClass\'         = MappleHIDTouch;"\n'
+        '    "     \'IOProviderClass\' = IOResources;"\n'
+        '    "     \'IOMatchCategory\' = MappleHIDTouch;"\n'
+        '    "   },"',
+        "",
+        "iokit/KernelConfigTables.cpp: remove duplicate generic MappleHIDTouch",
     )
     replace_exact(
         xnu / "iokit" / "bsddev" / "IOKitBSDInit.cpp",
@@ -219,6 +233,8 @@ static vm_offset_t a32_dsi0_va;
 static uint64_t a32_last_flush_ticks;
 static uint32_t a32_hw_ready;
 static uint32_t a32_dsi_inflight;
+static uint32_t _Atomic a32_dsi_dcs_busy;
+static uint32_t a32_bl_inited;
 
 static inline void
 a32_io_wr32(vm_offset_t base, uint32_t off, uint32_t val)
@@ -295,6 +311,17 @@ a32_dsi_cmd_flush_mode(int force)
 \tif (!a32_hw_ready || a32_dsi0_va == 0 || a32_mutex_va == 0 || a32_ovl0_va == 0) {
 \t\treturn;
 \t}
+\tif (os_atomic_load(&a32_dsi_dcs_busy, acquire) != 0) {
+\t\tif (!force) {
+\t\t\treturn;
+\t\t}
+\t\tuint64_t deadline = a32_cntpct_now() + 520000ULL;
+\t\twhile (os_atomic_load(&a32_dsi_dcs_busy, acquire) != 0) {
+\t\t\tif (a32_cntpct_now() >= deadline) {
+\t\t\t\treturn;
+\t\t\t}
+\t\t}
+\t}
 \t__asm__ volatile("dsb sy" ::: "memory");
 \tif (a32_dsi_is_busy()) {
 \t\tif (!force) {
@@ -323,6 +350,71 @@ void
 a32_dsi_cmd_flush_now(void)
 {
 \ta32_dsi_cmd_flush_mode(1);
+}
+
+static void
+a32_dsi_send_cmdq(uint32_t w0, uint32_t w1, uint32_t size)
+{
+\ta32_io_wr32(a32_dsi0_va, 0x00c, a32_io_rd32(a32_dsi0_va, 0x00c) & ~0x02u);
+\ta32_io_wr32(a32_dsi0_va, 0x200, w0);
+\tif (size > 1u) {
+\t\ta32_io_wr32(a32_dsi0_va, 0x204, w1);
+\t}
+\ta32_io_wr32(a32_dsi0_va, 0x060, size);
+\t__asm__ volatile("dsb sy" ::: "memory");
+\ta32_io_wr32(a32_dsi0_va, 0x000, 0u);
+\ta32_io_wr32(a32_dsi0_va, 0x000, 1u);
+\tuint64_t deadline = a32_cntpct_now() + 260000ULL; /* 20 ms @ 13 MHz */
+\twhile (!(a32_io_rd32(a32_dsi0_va, 0x00c) & 0x02u)) {
+\t\tif (a32_cntpct_now() >= deadline) {
+\t\t\tbreak;
+\t\t}
+\t}
+\ta32_io_wr32(a32_dsi0_va, 0x00c, a32_io_rd32(a32_dsi0_va, 0x00c) & ~0x02u);
+}
+
+int a32_dsi_set_brightness(uint32_t level_0_2047);
+int
+a32_dsi_set_brightness(uint32_t level_0_2047)
+{
+\tuint32_t bl_en = 1;
+\t(void)PE_parse_boot_argn("a32_bl", &bl_en, sizeof(bl_en));
+\tif (bl_en == 0) {
+\t\treturn 1;
+\t}
+\tif (!a32_hw_ready || a32_dsi0_va == 0 || a32_mutex_va == 0) {
+\t\treturn 0;
+\t}
+\tif (os_atomic_xchg(&a32_dsi_dcs_busy, 1u, acq_rel) != 0) {
+\t\treturn 0;
+\t}
+\t__asm__ volatile("dsb sy" ::: "memory");
+\tif (a32_dsi_is_busy()) {
+\t\tuint64_t deadline = a32_cntpct_now() + 520000ULL;
+\t\twhile (a32_dsi_is_busy()) {
+\t\t\tif (a32_cntpct_now() >= deadline) {
+\t\t\t\tos_atomic_store(&a32_dsi_dcs_busy, 0u, release);
+\t\t\t\treturn 0;
+\t\t\t}
+\t\t}
+\t}
+\tif (level_0_2047 > 2047u) {
+\t\tlevel_0_2047 = 2047u;
+\t}
+\tuint32_t b10 = level_0_2047 >> 1;
+\tif (level_0_2047 > 0u && b10 < 10u) {
+\t\tb10 = 10u;
+\t}
+\tif (!a32_bl_inited) {
+\t\ta32_dsi_send_cmdq(0x007a1508u, 0u, 1u); /* self-mask off */
+\t\ta32_dsi_send_cmdq(0x20531508u, 0u, 1u); /* normal display brightness control */
+\t\ta32_bl_inited = 1u;
+\t}
+\tuint32_t w0 = (3u << 16) | (0x39u << 8) | 0x0au;
+\tuint32_t w1 = 0x51u | (((b10 >> 8) & 0xffu) << 8) | ((b10 & 0xffu) << 16);
+\ta32_dsi_send_cmdq(w0, w1, 2u);
+\tos_atomic_store(&a32_dsi_dcs_busy, 0u, release);
+\treturn 1;
 }
 
 void a32_console_hw_init(void);
@@ -461,11 +553,12 @@ MapplePlatformExpert::start(IOService *provider)
 def patch_framebuffer(xnu: Path):
     p = xnu / "iokit" / "Kernel" / "arm" / "MappleFramebuffer.cpp"
 
-    # Forward-declare a32_dsi_cmd_flush_now near the top of the file (before AppleCLCD::presentQueued!)
+    # Forward-declare a32_dsi_cmd_flush_now / a32_dsi_set_brightness near the top of the file (before AppleCLCD!)
     old_decl = """extern "C" void mtk_ufs_safe_clear(void);                /* bsd/dev/mtk_ufs.c */"""
     new_decl = """extern "C" void mtk_ufs_safe_clear(void);                /* bsd/dev/mtk_ufs.c */
-extern "C" void a32_dsi_cmd_flush_now(void);             /* bsd/dev/mtk_ufs.c (SM-A325M DSI CMD) */"""
-    replace_exact(p, old_decl, new_decl, "MappleFramebuffer.cpp: declare a32_dsi_cmd_flush_now at top")
+extern "C" void a32_dsi_cmd_flush_now(void);             /* bsd/dev/mtk_ufs.c (SM-A325M DSI CMD) */
+extern "C" int a32_dsi_set_brightness(uint32_t level);   /* bsd/dev/mtk_ufs.c (SM-A325M S6E3FC3 DCS) */"""
+    replace_exact(p, old_decl, new_decl, "MappleFramebuffer.cpp: declare a32 DSI helpers at top")
 
     old_pa = """#define DISP_OVL0_PA            0x14005000ull
 #define DISP_OVL0_2L_PA         0x14006000ull
@@ -500,6 +593,21 @@ extern "C" void a32_dsi_cmd_flush_now(void);             /* bsd/dev/mtk_ufs.c (S
 \treturn ok ? pick : -1;"""
     replace_exact(p, old_pres, new_pres, "MappleFramebuffer.cpp: flush S6E3FC3 DSI CMD after present()")
 
+    old_bl = """\tif (bl != 0xffffffffu) {
+\t\tuint32_t pl = blPanel(bl);
+\t\tuint8_t cmd[3] = { 0x51, (uint8_t)(pl >> 8), (uint8_t)pl };
+\t\tif (bl == fBlLevel && fBlSent != 0 && !fBlResend) {
+\t\t\tblLog(bl, dark ? "display off" : fBlFrom, ": already there");
+\t\t\tfBlWant = 0xffffffffu;
+\t\t} else if (dsiSendDcs(cmd, 3, false, false)) {      /* non-blocking: a fade must not hold the frames */"""
+    new_bl = """\tif (bl != 0xffffffffu) {
+\t\tuint32_t pl = blPanel(bl);
+\t\tif (bl == fBlLevel && fBlSent != 0 && !fBlResend) {
+\t\t\tblLog(bl, dark ? "display off" : fBlFrom, ": already there");
+\t\t\tfBlWant = 0xffffffffu;
+\t\t} else if (a32_dsi_set_brightness(pl)) {"""
+    replace_exact(p, old_bl, new_bl, "MappleFramebuffer.cpp: S6E3FC3 command-mode brightness via a32_dsi_set_brightness")
+
 
 def patch_pmic(xnu: Path):
     """Accept MT6358 (hwcid 0x58xx, SM-A325M = 0x5831) alongside MT6366 (0x66xx), and allow VCAMA2 for touch AVDD."""
@@ -519,240 +627,25 @@ def patch_pmic(xnu: Path):
         "\t{ 0x1d90, 0x0002, 0x01 },       /* LDO_VCN28_OP_CFG: HW0_OP_CFG */\n"
         "\t/* SM-A325M FTS5CU56A touch 3.0V AVDD (tsp_avdd_ldo = ldo_vcama2) */\n"
         "\t{ 0x1e0c, 0x0f00, 0x0c },       /* VCAMA2_ANA_CON0: VOSEL[11:8] <= 0xc (3.0 V) */\n"
-        "\t{ 0x1c88, 0x0001, 0x01 },       /* LDO_VCAMA2_CON0: RG_LDO_VCAMA2_EN */\n};",
-        "MTKPwrap.cpp: whitelist MT6358 VCAMA2 (3.0V touch AVDD)",
-    )
-
-
-def patch_i2c_dma(xnu: Path):
-    """Add MT6768 APDMA support to MTKI2C for rlen > 8 (16-byte FTS5CU56A touch events)."""
-    h = xnu / "iokit" / "Kernel" / "arm" / "MTKIO.h"
-    replace_exact(
-        h,
-        "#include <IOKit/IOMemoryDescriptor.h>",
-        "#include <IOKit/IOMemoryDescriptor.h>\n#include <IOKit/IOBufferMemoryDescriptor.h>",
-        "MTKIO.h: include IOBufferMemoryDescriptor.h",
+        "\t{ 0x1c8a, 0x0001, 0x01 },       /* LDO_VCAMA2_OP_EN: SW_OP_EN */\n"
+        "\t{ 0x1c88, 0x0001, 0x01 },       /* LDO_VCAMA2_CON0: RG_LDO_VCAMA2_EN */\n"
+        "\t/* SM-A325M a32_cpufreq VSRAM rails (0.5 V + 6.25 mV * step <= 1.11875 V) */\n"
+        "\t{ 0x1bee, 0x007f, 0x63 },       /* LDO_VSRAM_CON0: VSRAM_PROC11 */\n"
+        "\t{ 0x1bf0, 0x007f, 0x63 },       /* LDO_VSRAM_CON1: VSRAM_PROC12 */\n};",
+        "MTKPwrap.cpp: whitelist VCAMA2 (touch AVDD) and VSRAM_PROC11/12",
     )
     replace_exact(
-        h,
-        "\tuint32_t                fErrors;\n};",
-        "\tuint32_t                fErrors;\n"
-        "\tvm_offset_t             fDmaRegs;\n"
-        "\tIOBufferMemoryDescriptor *fDmaDesc;\n"
-        "\tIOMemoryMap            *fDmaMap;\n"
-        "\tvolatile uint8_t       *fDmaBuf;\n"
-        "\tuint64_t                fDmaPa;\n"
-        "\tbool                    fReportedDmaPoll;\n"
-        "\tbool                    fTransferActive;\n};",
-        "MTKIO.h: add APDMA fields to MTKI2C",
-    )
-
-    c = xnu / "iokit" / "Kernel" / "arm" / "MTKIO.cpp"
-    replace_exact(
-        c,
-        '#include "MTKIO.h"',
-        '#include "MTKIO.h"\n#include <mach/mach_time.h>\n'
-        'extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);\n'
-        'static constexpr uint32_t kA32ApdmaRxOffset = 64;\n'
-        'static constexpr uint32_t kA32ApdmaMaxRead = 512;\n'
-        'static constexpr uint32_t kA32ApdmaIntFlag = 0x00;\n'
-        'static constexpr uint32_t kA32ApdmaEnable = 0x08;\n'
-        'static constexpr uint32_t kA32ApdmaRxAddress = 0x20;\n'
-        'static constexpr uint32_t kA32ApdmaDone = 0x03;\n'
-        '\n'
-        'static bool\n'
-        'a32ApdmaReadDone(vm_offset_t regs, uint32_t rxEnd)\n'
-        '{\n'
-        '\tconst volatile uint32_t *dma = (const volatile uint32_t *)regs;\n'
-        '\treturn dma[kA32ApdmaEnable / 4] == 0 &&\n'
-        '\t       (dma[kA32ApdmaIntFlag / 4] & kA32ApdmaDone) == kA32ApdmaDone &&\n'
-        '\t       dma[kA32ApdmaRxAddress / 4] == rxEnd;\n'
-        '}',
-        "MTKIO.cpp: declare ml_io_map for APDMA",
+        pw,
+        'extern "C" void mt6781_cpufreq_start(void);       /* osfmk/arm64/mt6781_cpufreq.c: CPU DVFS needs the PMIC */',
+        'extern "C" void mt6781_cpufreq_start(void);       /* osfmk/arm64/mt6781_cpufreq.c: CPU DVFS needs the PMIC */\n'
+        'extern "C" void a32_cpufreq_start(void);          /* bsd/dev/a32_cpufreq.c: SM-A325M fixed CPU raise */',
+        "MTKPwrap.cpp: declare a32_cpufreq_start",
     )
     replace_exact(
-        c,
-        "\tinitHW();\n\tfInterrupt->enable();",
-        "\tuint32_t dmaPa = dtU32(provider, \"dma-base\", 0);\n"
-        "\tif (dmaPa != 0) {\n"
-        "\t\tfDmaRegs = ml_io_map((vm_offset_t)dmaPa, 0x80);\n"
-        "\t\tfDmaDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,\n"
-        "\t\t    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 4096, 0xfffffffffffff000ull);\n"
-        "\t\tif (fDmaRegs != 0 && fDmaDesc != NULL) {\n"
-        "\t\t\tfDmaPa = fDmaDesc->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);\n"
-        "\t\t\tbzero(fDmaDesc->getBytesNoCopy(), 4096);\n"
-        "\t\t\tfDmaDesc->performOperation(kIOMemoryIncoherentIOFlush, 0, 4096);\n"
-        "\t\t\tfDmaMap = fDmaDesc->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache, 0, 0);\n"
-        "\t\t\tif (fDmaMap != NULL) {\n"
-        "\t\t\t\tfDmaBuf = (volatile uint8_t *)fDmaMap->getVirtualAddress();\n"
-        "\t\t\t\tIOLog(\"I2C: bus %u APDMA @ 0x%x buf pa 0x%llx\\n\", fBusId, dmaPa, fDmaPa);\n"
-        "\t\t\t}\n"
-        "\t\t}\n"
-        "\t}\n"
-        "\tinitHW();\n\tfInterrupt->enable();",
-        "MTKIO.cpp: map APDMA and coherent buffer in MTKI2C::start",
-    )
-    replace_exact(
-        c,
-        "\tOSSafeReleaseNULL(fMap);\n\tOSSafeReleaseNULL(fWorkLoop);",
-        "\tOSSafeReleaseNULL(fDmaMap);\n\tOSSafeReleaseNULL(fDmaDesc);\n\tOSSafeReleaseNULL(fMap);\n\tOSSafeReleaseNULL(fWorkLoop);",
-        "MTKIO.cpp: release APDMA resources in MTKI2C::free",
-    )
-    replace_exact(
-        c,
-        "\tif (addr > 0x7f || wlen == 0 || wlen > kFIFOSize || rlen > kFIFOSize || (rlen && rbuf == NULL)) {\n"
-        "\t\treturn kIOReturnBadArgument;\n"
-        "\t}",
-        "\t/* FTS5CU56A can return 31 queued 16-byte events in a single read. */\n"
-        "\tuint32_t maxR = (fDmaRegs != 0 && fDmaBuf != NULL) ? kA32ApdmaMaxRead : (uint32_t)kFIFOSize;\n"
-        "\tif (addr > 0x7f || wlen == 0 || wlen > kFIFOSize || rlen > maxR || (rlen && rbuf == NULL)) {\n"
-        "\t\treturn kIOReturnBadArgument;\n"
-        "\t}",
-        "MTKIO.cpp: allow up to 512-byte reads when APDMA is configured",
-    )
-    replace_exact(
-        c,
-        "\t\treturn transferGated(addr, wbuf, wlen, rbuf, rlen);",
-        "\t\t/* commandSleep(&fDone) drops the gate while waiting for the I2C IRQ. */\n"
-        "\t\twhile (fTransferActive) {\n"
-        "\t\t\tfGate->commandSleep(&fTransferActive, THREAD_UNINT);\n"
-        "\t\t}\n"
-        "\t\tfTransferActive = true;\n"
-        "\t\tIOReturn kr = transferGated(addr, wbuf, wlen, rbuf, rlen);\n"
-        "\t\tfTransferActive = false;\n"
-        "\t\tfGate->commandWakeup(&fTransferActive);\n"
-        "\t\treturn kr;",
-        "MTKIO.cpp: serialize transfers while waiting for the hardware IRQ",
-    )
-    replace_exact(
-        c,
-        "\tbool wrrd = rlen != 0;\n"
-        "\n"
-        "\twr16(I2C_HW_TIMEOUT, fHWTimeout);\n"
-        "\twr16(I2C_CLOCK_DIV, (uint16_t)(((fClockDiv - 1) << 8) | (fClockDiv - 1)));\n"
-        "\tuint16_t control = CONTROL_ACKERR_DET_EN | CONTROL_CLK_EXT_EN;\n"
-        "\tif (wrrd) {\n"
-        "\t\tcontrol |= CONTROL_DIR_CHANGE | CONTROL_RS;\n"
-        "\t}\n"
-        "\twr16(I2C_CONTROL, control);",
-        "\tbool wrrd = rlen != 0;\n"
-        "\tbool useDma = wrrd && rlen > kFIFOSize && fDmaRegs != 0 && fDmaBuf != NULL;\n"
-        "\tuint32_t rxEnd = (uint32_t)(fDmaPa + kA32ApdmaRxOffset + rlen);\n"
-        "\n"
-        "\twr16(I2C_HW_TIMEOUT, fHWTimeout);\n"
-        "\twr16(I2C_CLOCK_DIV, (uint16_t)(((fClockDiv - 1) << 8) | (fClockDiv - 1)));\n"
-        "\tuint16_t control = CONTROL_ACKERR_DET_EN | CONTROL_CLK_EXT_EN;\n"
-        "\tif (wrrd) {\n"
-        "\t\tcontrol |= CONTROL_DIR_CHANGE | CONTROL_RS;\n"
-        "\t}\n"
-        "\tif (useDma) {\n"
-        "\t\t/* MT6768 i2c-mtk.c enables DMA, DMA ACK and async handshaking together. */\n"
-        "\t\tcontrol |= (1u << 2) | (1u << 8) | (1u << 9);\n"
-        "\t}\n"
-        "\twr16(I2C_CONTROL, control);",
-        "MTKIO.cpp: set I2C_CONTROL_DMA_EN for rlen > 8",
-    )
-    replace_exact(
-        c,
-        "\tfor (uint32_t i = 0; i < wlen; i++) {\n"
-        "\t\t*(volatile uint8_t *)(fRegs + I2C_DATA_PORT) = wbuf[i];\n"
-        "\t}",
-        "\tif (useDma) {\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x0c) = 1; /* DMA warm RST */\n"
-        "\t\tIODelay(5);\n"
-        "\t\tfor (uint32_t i = 0; i < wlen; i++) {\n"
-        "\t\t\tfDmaBuf[i] = wbuf[i];\n"
-        "\t\t}\n"
-        "\t\t/* Keep the TX opcode out of the RX slot if a read fails to fill it. */\n"
-        "\t\tfor (uint32_t i = 0; i < rlen; i++) {\n"
-        "\t\t\tfDmaBuf[kA32ApdmaRxOffset + i] = 0;\n"
-        "\t\t}\n"
-        "\t\tuint64_t rxPa = fDmaPa + kA32ApdmaRxOffset;\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + kA32ApdmaIntFlag) = 0;\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x18) = 0; /* CON = WRRD */\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x1c) = (uint32_t)fDmaPa;\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + kA32ApdmaRxAddress) = (uint32_t)rxPa;\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x54) = (uint32_t)(fDmaPa >> 32);\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x58) = (uint32_t)(rxPa >> 32);\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x24) = wlen;\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x28) = rlen;\n"
-        "\t\t/* Make the write-combined buffer visible to the non-coherent APDMA. */\n"
-        "\t\t__asm__ volatile(\"dsb sy\" ::: \"memory\");\n"
-        "\t\t*(volatile uint32_t *)(fDmaRegs + kA32ApdmaEnable) = 1;\n"
-        "\t} else {\n"
-        "\t\tfor (uint32_t i = 0; i < wlen; i++) {\n"
-        "\t\t\t*(volatile uint8_t *)(fRegs + I2C_DATA_PORT) = wbuf[i];\n"
-        "\t\t}\n"
-        "\t}",
-        "MTKIO.cpp: program APDMA for WRRD transactions with rlen > 8",
-    )
-    replace_exact(
-        c,
-        "\twhile (!fDone) {\n"
-        "\t\tif (fGate->commandSleep(&fDone, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {\n"
-        "\t\t\tbreak;\n"
-        "\t\t}\n"
-        "\t}",
-        "\twhile (!fDone) {\n"
-        "\t\tAbsoluteTime wake = deadline;\n"
-        "\t\tif (useDma) {\n"
-        "\t\t\tclock_interval_to_deadline(2, kMillisecondScale, &wake);\n"
-        "\t\t\tif (wake > deadline) {\n"
-        "\t\t\t\twake = deadline;\n"
-        "\t\t\t}\n"
-        "\t\t}\n"
-        "\t\tif (fGate->commandSleep(&fDone, wake, THREAD_UNINT) != THREAD_TIMED_OUT || fDone) {\n"
-        "\t\t\tcontinue;\n"
-        "\t\t}\n"
-        "\t\tif (useDma) {\n"
-        "\t\t\tuint16_t pending = rd16(I2C_INTR_STAT) & (INTR_TRANSAC_COMP | INTR_ERRORS);\n"
-        "\t\t\tif (pending != 0) {\n"
-        "\t\t\t\twr16(I2C_INTR_STAT, pending);\n"
-        "\t\t\t\tfIrqStat = pending;\n"
-        "\t\t\t\tfDone = true;\n"
-        "\t\t\t\tbreak;\n"
-        "\t\t\t}\n"
-        "\t\t\t/* On A32, a completed WRRD can leave START and INTR_STAT both zero. */\n"
-        "\t\t\tif (rd16(I2C_START) == 0 && a32ApdmaReadDone(fDmaRegs, rxEnd)) {\n"
-        "\t\t\t\tfDone = true;\n"
-        "\t\t\t\tif (!fReportedDmaPoll) {\n"
-        "\t\t\t\t\tfReportedDmaPoll = true;\n"
-        "\t\t\t\t\tIOLog(\"I2C: bus %u confirmed APDMA completion without MCU IRQ\\n\", fBusId);\n"
-        "\t\t\t\t}\n"
-        "\t\t\t\tbreak;\n"
-        "\t\t\t}\n"
-        "\t\t}\n"
-        "\t\tif (mach_absolute_time() >= deadline) {\n"
-        "\t\t\tbreak;\n"
-        "\t\t}\n"
-        "\t}",
-        "MTKIO.cpp: confirm completed APDMA transfers if the controller IRQ is missed",
-    )
-    replace_exact(
-        c,
-        "\tfor (uint32_t i = 0; i < rlen; i++) {\n"
-        "\t\trbuf[i] = *(volatile uint8_t *)(fRegs + I2C_DATA_PORT);\n"
-        "\t}",
-        "\tif (useDma) {\n"
-        "\t\tfor (unsigned int i = 0; i < 100 && !a32ApdmaReadDone(fDmaRegs, rxEnd); i++) {\n"
-        "\t\t\tIODelay(1);\n"
-        "\t\t}\n"
-        "\t\tif (!a32ApdmaReadDone(fDmaRegs, rxEnd)) {\n"
-        "\t\t\tif (++fErrors <= 8) {\n"
-        "\t\t\t\tIOLog(\"I2C: bus %u short APDMA read (%u bytes requested)\\n\", fBusId, rlen);\n"
-        "\t\t\t}\n"
-        "\t\t\treturn kIOReturnIOError;\n"
-        "\t\t}\n"
-        "\t\t__asm__ volatile(\"dsb sy\" ::: \"memory\");\n"
-        "\t\tfor (uint32_t i = 0; i < rlen; i++) {\n"
-        "\t\t\trbuf[i] = fDmaBuf[kA32ApdmaRxOffset + i];\n"
-        "\t\t}\n"
-        "\t} else {\n"
-        "\t\tfor (uint32_t i = 0; i < rlen; i++) {\n"
-        "\t\t\trbuf[i] = *(volatile uint8_t *)(fRegs + I2C_DATA_PORT);\n"
-        "\t\t}\n"
-        "\t}",
-        "MTKIO.cpp: wait for APDMA completion and copy the RX buffer back to caller",
+        pw,
+        "\tmt6781_cpufreq_start();",
+        "\tmt6781_cpufreq_start();\n\ta32_cpufreq_start();",
+        "MTKPwrap.cpp: call a32_cpufreq_start() after PMIC attach",
     )
 
 
@@ -840,7 +733,6 @@ def main():
     patch_pe_serial(xnu)
     patch_platform_expert(xnu)
     patch_pmic(xnu)
-    patch_i2c_dma(xnu)
     patch_framebuffer(xnu)
     patch_usb_link(xnu)
     print("Overlay applied cleanly!")
