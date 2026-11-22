@@ -199,7 +199,7 @@ mapple_log_append(const char *c, int size)
 #define A32_RAMOOPS_SIZE     0x40000U
 #define A32_RAMOOPS_SIG      0x43474244U /* "DBGC" */
 #define A32_INFRACFG_PA      0x10001000UL
-#define A32_IFR2_CG_CLR      0x084U      /* bit 11 = CLK_IFR_I2C_AP */
+#define A32_IFR2_CG_CLR      0x084U      /* bit 8 = CLK_IFR_ICUSB, bit 11 = CLK_IFR_I2C_AP */
 #define A32_IFR5_CG_CLR      0x0c4U      /* bit 6 = CLK_IFR_I2C6, bit 7 = CLK_IFR_AP_MSDC0 */
 #define A32_OVL0_PA          0x1400b000UL
 #define A32_MUTEX_PA         0x14001000UL
@@ -336,10 +336,10 @@ a32_console_hw_init(void)
 \ta32_mutex_va   = ml_io_map(A32_MUTEX_PA, 0x1000);
 \ta32_dsi0_va    = ml_io_map(A32_DSI0_PA, 0x1000);
 
-\t/* Ensure MT6768 infracfg_ao clock gates for I2C6 (touch) and MSDC0 (eMMC) are open */
+\t/* Ensure MT6768 infracfg_ao clock gates for USB, I2C6 (touch) and MSDC0 (eMMC) are open */
 \tvm_offset_t infra = ml_io_map(A32_INFRACFG_PA, 0x1000);
 \tif (infra != 0) {
-\t\ta32_io_wr32(infra, A32_IFR2_CG_CLR, (1u << 11));
+\t\ta32_io_wr32(infra, A32_IFR2_CG_CLR, (1u << 8) | (1u << 11));
 \t\ta32_io_wr32(infra, A32_IFR5_CG_CLR, (1u << 6) | (1u << 7));
 \t\t__asm__ volatile("dsb sy" ::: "memory");
 \t}
@@ -512,6 +512,79 @@ def patch_pmic(xnu: Path):
     )
 
 
+def patch_usb_link(xnu: Path):
+    """Port usb_link.c (mp_usblink=3) to MT6768 T-PHY (0x11cc0000 + 0x800) and add chown/fpatch."""
+    p = xnu / "bsd" / "dev" / "usb_link.c"
+    replace_exact(
+        p,
+        "#define TPHY_PA         0x11ca0000u\n"
+        "#define U2PORT          0x300           /* u2port0 inside the T-PHY block */",
+        "#define TPHY_PA         0x11cc0000u     /* MT6768 / SM-A325M T-PHY base */\n"
+        "#define U2PORT          0x800           /* MT6768 u2port0 offset inside T-PHY */",
+        "usb_link.c: MT6768 TPHY_PA (0x11cc0000) and U2PORT (0x800)",
+    )
+    replace_exact(
+        p,
+        '\t} else if (IS("pull")) {\n'
+        '\t\tvl_pull_start(rest);',
+        '\t} else if (IS("pull")) {\n'
+        '\t\tvl_pull_start(rest);\n'
+        '\t} else if (IS("chown")) {\n'
+        '\t\tuint64_t uid = 0, gid = 0, mode = 0;\n'
+        '\t\tif (!vl_arg(&rest, &uid) || !vl_arg(&rest, &gid) || !vl_arg(&rest, &mode)) {\n'
+        '\t\t\tvl_reply("usage: chown UID GID MODE PATH\\n");\n'
+        '\t\t} else {\n'
+        '\t\t\twhile (*rest == \' \') { rest++; }\n'
+        '\t\t\tif (!vl_path_ok(rest) || rootvnode == NULLVP) {\n'
+        '\t\t\t\tvl_reply("chown: bad path or no root\\n");\n'
+        '\t\t\t} else {\n'
+        '\t\t\t\tvfs_context_t ctx = vfs_context_kernel();\n'
+        '\t\t\t\tvnode_t vp = NULLVP;\n'
+        '\t\t\t\tint err = vnode_open(rest, FREAD, 0, 0, &vp, ctx);\n'
+        '\t\t\t\tif (err) {\n'
+        '\t\t\t\t\tvl_reply("chown %s: open error %d\\n", rest, err);\n'
+        '\t\t\t\t} else {\n'
+        '\t\t\t\t\tstruct vnode_attr va;\n'
+        '\t\t\t\t\tVATTR_INIT(&va);\n'
+        '\t\t\t\t\tVATTR_SET(&va, va_uid, (uid_t)uid);\n'
+        '\t\t\t\t\tVATTR_SET(&va, va_gid, (gid_t)gid);\n'
+        '\t\t\t\t\tVATTR_SET(&va, va_mode, (mode_t)(mode & 07777));\n'
+        '\t\t\t\t\terr = vnode_setattr(vp, &va, ctx);\n'
+        '\t\t\t\t\tvnode_close(vp, FREAD, ctx);\n'
+        '\t\t\t\t\tvl_reply("chown %s (%llu:%llu 0%llo): %s (%d)\\n", rest, uid, gid, mode & 07777, err ? "ERR" : "ok", err);\n'
+        '\t\t\t\t}\n'
+        '\t\t\t}\n'
+        '\t\t}\n'
+        '\t} else if (IS("fpatch")) {\n'
+        '\t\tuint64_t off = 0, val = 0;\n'
+        '\t\tif (!vl_arg(&rest, &off) || !vl_arg(&rest, &val)) {\n'
+        '\t\t\tvl_reply("usage: fpatch OFF U64_LE PATH\\n");\n'
+        '\t\t} else {\n'
+        '\t\t\twhile (*rest == \' \') { rest++; }\n'
+        '\t\t\tif (!vl_path_ok(rest) || rootvnode == NULLVP) {\n'
+        '\t\t\t\tvl_reply("fpatch: bad path or no root\\n");\n'
+        '\t\t\t} else {\n'
+        '\t\t\t\tvfs_context_t ctx = vfs_context_kernel();\n'
+        '\t\t\t\tvnode_t vp = NULLVP;\n'
+        '\t\t\t\tint err = vnode_open(rest, FREAD | FWRITE, 0, 0, &vp, ctx);\n'
+        '\t\t\t\tif (err) {\n'
+        '\t\t\t\t\tvl_reply("fpatch %s: open error %d\\n", rest, err);\n'
+        '\t\t\t\t} else {\n'
+        '\t\t\t\t\tuint64_t cur = 0;\n'
+        '\t\t\t\t\tint resid = 0;\n'
+        '\t\t\t\t\terr = vn_rdwr(UIO_READ, vp, (caddr_t)&cur, 8, (off_t)off, UIO_SYSSPACE, IO_NOAUTH, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));\n'
+        '\t\t\t\t\tif (!err && resid == 0) {\n'
+        '\t\t\t\t\t\terr = vn_rdwr(UIO_WRITE, vp, (caddr_t)&val, 8, (off_t)off, UIO_SYSSPACE, IO_NOAUTH | IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));\n'
+        '\t\t\t\t\t}\n'
+        '\t\t\t\t\tvnode_close(vp, FREAD | FWRITE, ctx);\n'
+        '\t\t\t\t\tvl_reply("fpatch %s +0x%llx: 0x%016llx -> 0x%016llx (%s %d)\\n", rest, off, cur, val, err ? "ERR" : "ok", err);\n'
+        '\t\t\t\t}\n'
+        '\t\t\t}\n'
+        '\t\t}',
+        "usb_link.c: add chown and fpatch commands for live rootfs repair",
+    )
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("Usage: apply_a32_overlay.py <path/to/xnu>")
@@ -524,6 +597,7 @@ def main():
     patch_platform_expert(xnu)
     patch_pmic(xnu)
     patch_framebuffer(xnu)
+    patch_usb_link(xnu)
     print("Overlay applied cleanly!")
 
 
