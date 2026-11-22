@@ -334,6 +334,7 @@ emmc_load_gpt(void)
 	emmc_gpt_count = count;
 	emmc_gpt_entsize = entsize;
 	emmc_gpt_loaded = true;
+	printf("emmc: MSDC0 GPT OK (%u entries @ LBA %llu)\n", count, entries_lba);
 	return true;
 }
 

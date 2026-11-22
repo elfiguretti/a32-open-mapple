@@ -36,10 +36,10 @@ static inline uint64_t a32_cntpct(void)
 	return v;
 }
 
-static inline void a32_dsi_wait_idle(uint64_t max_ticks)
+static inline void a32_dsi_wait_done(uint64_t max_ticks)
 {
 	uint64_t deadline = a32_cntpct() + max_ticks;
-	while (a32_rd32(A32_DSI0_STA) & (1u << 31)) {
+	while ((a32_rd32(A32_MUTEX0_EN) & 1u) || !(a32_rd32(A32_DSI0_INTSTA) & 0x10u)) {
 		if (a32_cntpct() >= deadline)
 			break;
 	}
@@ -48,8 +48,12 @@ static inline void a32_dsi_wait_idle(uint64_t max_ticks)
 static inline void a32_dsi_flush(void)
 {
 	__asm__ volatile("dsb sy" ::: "memory");
-	/* 13 MHz timer: 455000 ticks = 35 ms (> 16.6 ms AMOLED frame period) */
-	a32_dsi_wait_idle(455000ULL);
+	/* Wait for any previous transfer to leave MUTEX0 idle before touching DSI0 */
+	uint64_t pre_deadline = a32_cntpct() + 520000ULL; /* 40 ms @ 13 MHz */
+	while ((a32_rd32(A32_MUTEX0_EN) & 1u) || (a32_rd32(A32_DSI0_STA) & (1u << 31))) {
+		if (a32_cntpct() >= pre_deadline)
+			break;
+	}
 	a32_wr32(A32_OVL0_SRC_CON, 1u);
 	a32_wr32(A32_DSI0_INTSTA, 0u);
 	a32_wr32(A32_DSI0_CMDQ_DATA0, 0x002c3909u);
@@ -58,7 +62,8 @@ static inline void a32_dsi_flush(void)
 	a32_wr32(A32_DSI0_START, 0u);
 	a32_wr32(A32_DSI0_START, 1u);
 	__asm__ volatile("dsb sy" ::: "memory");
-	a32_dsi_wait_idle(455000ULL);
+	/* Wait for FRAME_DONE (DSI0_INTSTA bit 4 = 0x10) and MUTEX0_EN auto-clear (~16.6 ms) */
+	a32_dsi_wait_done(520000ULL);
 }
 
 static inline void a32_plog_reset(void)

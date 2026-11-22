@@ -45,7 +45,19 @@ def main():
     port = Path(args.port_shim).resolve()
     out_img = Path(args.out).resolve()
     obj_dir = out_img.parent / "shim_a32_obj"
-    obj_dir.mkdir(parents=True, exist_ok=True)
+    src_dir = obj_dir / "src"
+    if src_dir.exists():
+        shutil.rmtree(src_dir)
+    src_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stage upstream shim sources + headers, then overlay SM-A325M files on top so
+    # `#include "console.h"` in loader.c resolves to our SM-A325M console.h (FB_BASE=0x7c720000)!
+    for p in ref.iterdir():
+        if p.is_file():
+            shutil.copyfile(p, src_dir / p.name)
+    for p in port.iterdir():
+        if p.is_file():
+            shutil.copyfile(p, src_dir / p.name)
 
     cc, lld = find_toolchain()
     cflags = [
@@ -55,20 +67,19 @@ def main():
         "-mgeneral-regs-only", "-mstrict-align", "-fno-stack-protector",
         "-Wall", "-Wextra",
         "-DMT6781_SHIM", "-DA32",
-        f"-I{port}",
-        f"-I{ref}",
+        f"-I{src_dir}",
         *args.extra_cflag,
     ]
 
-    # Use our A32 mt6768.c & console.c, plus upstream start.S, fdt.c, holes.c, identity.c, loader.c
+    # Use our staged A32 mt6768.c & console.c, plus upstream start.S, fdt.c, holes.c, identity.c, loader.c
     sources = [
-        ref / "start.S",
-        port / "mt6768.c",
-        port / "console.c",
-        ref / "fdt.c",
-        ref / "holes.c",
-        ref / "identity.c",
-        ref / "loader.c",
+        src_dir / "start.S",
+        src_dir / "mt6768.c",
+        src_dir / "console.c",
+        src_dir / "fdt.c",
+        src_dir / "holes.c",
+        src_dir / "identity.c",
+        src_dir / "loader.c",
     ]
     objs = []
     c_objs = []

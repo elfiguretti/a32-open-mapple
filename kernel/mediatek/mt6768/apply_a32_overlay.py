@@ -217,6 +217,7 @@ static vm_offset_t a32_mutex_va;
 static vm_offset_t a32_dsi0_va;
 static uint64_t a32_last_flush_ticks;
 static uint32_t a32_hw_ready;
+static uint32_t a32_dsi_inflight;
 
 static inline void
 a32_io_wr32(vm_offset_t base, uint32_t off, uint32_t val)
@@ -273,6 +274,19 @@ a32_ramoops_putc_early(uint8_t ch)
 \t}
 }
 
+static inline int
+a32_dsi_is_busy(void)
+{
+\tif ((a32_io_rd32(a32_mutex_va, 0x020) & 1u) || (a32_io_rd32(a32_dsi0_va, 0x004) & (1u << 31))) {
+\t\treturn 1;
+\t}
+\tif (a32_dsi_inflight && !(a32_io_rd32(a32_dsi0_va, 0x00c) & 0x10u)) {
+\t\treturn 1;
+\t}
+\ta32_dsi_inflight = 0;
+\treturn 0;
+}
+
 void a32_dsi_cmd_flush_mode(int force);
 void
 a32_dsi_cmd_flush_mode(int force)
@@ -281,12 +295,12 @@ a32_dsi_cmd_flush_mode(int force)
 \t\treturn;
 \t}
 \t__asm__ volatile("dsb sy" ::: "memory");
-\tif (a32_io_rd32(a32_dsi0_va, 0x004) & (1u << 31)) {
+\tif (a32_dsi_is_busy()) {
 \t\tif (!force) {
-\t\t\treturn; /* mid-frame: never tear the AMOLED panel */
+\t\t\treturn; /* mid-frame: never tear or lock up DSI0 */
 \t\t}
-\t\tuint64_t deadline = a32_cntpct_now() + 455000ULL; /* 35 ms @ 13 MHz */
-\t\twhile (a32_io_rd32(a32_dsi0_va, 0x004) & (1u << 31)) {
+\t\tuint64_t deadline = a32_cntpct_now() + 520000ULL; /* 40 ms @ 13 MHz */
+\t\twhile (a32_dsi_is_busy()) {
 \t\t\tif (a32_cntpct_now() >= deadline) {
 \t\t\t\tbreak;
 \t\t\t}
@@ -299,6 +313,7 @@ a32_dsi_cmd_flush_mode(int force)
 \ta32_io_wr32(a32_mutex_va, 0x020, 1u);
 \ta32_io_wr32(a32_dsi0_va, 0x000, 0u);
 \ta32_io_wr32(a32_dsi0_va, 0x000, 1u);
+\ta32_dsi_inflight = 1;
 \t__asm__ volatile("dsb sy" ::: "memory");
 }
 
@@ -484,6 +499,19 @@ extern "C" void a32_dsi_cmd_flush_now(void);             /* bsd/dev/mtk_ufs.c (S
     replace_exact(p, old_pres, new_pres, "MappleFramebuffer.cpp: flush S6E3FC3 DSI CMD after present()")
 
 
+def patch_pmic(xnu: Path):
+    """Accept MT6358 (hwcid 0x58xx, SM-A325M = 0x5831) alongside MT6366 (0x66xx)."""
+    p = xnu / "iokit" / "Kernel" / "arm" / "MT6358PMIC.cpp"
+    replace_exact(
+        p,
+        "\tif (read(MT6358_PMIC_HWCID, &id) != kIOReturnSuccess || (id & 0xff00) != 0x6600) {\n"
+        "\t\tIOLog(\"PMIC: hwcid 0x%04x is not an MT6366, not touching it\\n\", id);",
+        "\tif (read(MT6358_PMIC_HWCID, &id) != kIOReturnSuccess || ((id & 0xff00) != 0x6600 && (id & 0xff00) != 0x5800)) {\n"
+        "\t\tIOLog(\"PMIC: hwcid 0x%04x is not an MT6358/MT6366, not touching it\\n\", id);",
+        "MT6358PMIC.cpp: accept MT6358 hwcid 0x58xx (SM-A325M = 0x5831)",
+    )
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("Usage: apply_a32_overlay.py <path/to/xnu>")
@@ -494,6 +522,7 @@ def main():
     patch_mtk_ufs(xnu)
     patch_pe_serial(xnu)
     patch_platform_expert(xnu)
+    patch_pmic(xnu)
     patch_framebuffer(xnu)
     print("Overlay applied cleanly!")
 
