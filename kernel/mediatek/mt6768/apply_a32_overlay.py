@@ -728,6 +728,360 @@ def patch_usb_link(xnu: Path):
     )
 
 
+def patch_gpu_mt6768(xnu: Path):
+    """Port MappleGPU.{h,cpp} from MT6781 Valhall (Mali-G57) to MT6768 Bifrost (Mali-G52 MC2)."""
+    h = xnu / "iokit" / "Kernel" / "arm" / "MappleGPU.h"
+    replace_exact(
+        h,
+        "\tvoid protRelease(int from = 3);",
+        "\tvoid protRelease(int from = 1);",
+        "MappleGPU.h: protRelease default 1 (MT6768 2-step bus protect)",
+    )
+    replace_exact(
+        h,
+        "\tint cacheMode(void) const { return fCacheMode; }",
+        "\tint cacheMode(void) const { return fCacheMode; }\n"
+        "\tuint32_t vaBits(void) const { uint32_t b = fMmuFeatures & 0xff; return (b >= 31 && b <= 48) ? b : 48; }",
+        "MappleGPU.h: add vaBits() helper for 35-bit Bifrost MMU",
+    )
+
+    p = xnu / "iokit" / "Kernel" / "arm" / "MappleGPU.cpp"
+    replace_exact(
+        p,
+        """/* SPM 0x10006000 */
+#define SPM_POWERON_CONFIG_EN   0x000
+#define SPM_PROJECT_KEY         0x0b160001u
+#define SPM_PWR_STATUS          0x16c
+#define SPM_PWR_STATUS_2ND      0x170
+#define SPM_MFG_PWR_CON(n)      (0x308 + 4 * (n))
+#define PWR_RST_B               (1u << 0)
+#define PWR_ISO                 (1u << 1)
+#define PWR_ON                  (1u << 2)
+#define PWR_ON_2ND              (1u << 3)
+#define PWR_CLK_DIS             (1u << 4)
+#define PWR_SRAM_PDN            (1u << 8)
+#define PWR_SRAM_PDN_ACK        (1u << 12)
+#define MFG_STATUS_BIT(n)       (1u << (2 + (n)))
+
+/* infracfg_ao 0x10001000: bus protection for MFG1 */
+#define INFRA_PROT_SET          0x2a0
+#define INFRA_PROT_CLR          0x2a4
+#define INFRA_PROT_STA1         0x228
+#define INFRA_PROT1_SET         0x2a8
+#define INFRA_PROT1_CLR         0x2ac
+#define INFRA_PROT1_STA1        0x258
+#define INFRA_ACP_CON           0x290   /* bit 9: ACP off (gpufreq probe) */
+
+/* topckgen 0x10000000, apmixed 0x1000c000 */
+#define CK_CFG_UPDATE           0x004
+#define CK_CFG_UPDATE_MFG       (1u << 2)
+#define CK_CFG_0                0x040
+#define CK_CFG_0_SET            0x044
+#define CK_CFG_0_CLR            0x048
+#define CK_MFG_SEL_SHIFT        16
+#define CK_MFG_SEL_MASK         (3u << 16)
+#define CK_MFG_PDN              (1u << 23)
+#define CK_MFG_MFGPLL           1u
+#define CK_MFG_MAINPLL_D5       3u
+#define PLL_MFG_CON0            0x250   /* bit 0 EN */
+#define PLL_MFG_CON1            0x254
+#define PLL_MFG_PWR_CON0        0x25c   /* bit 0 PWR_ON, bit 1 ISO */""",
+        """/* SPM 0x10006000 (MT6768 / SM-A325M) */
+#define SPM_POWERON_CONFIG_EN   0x000
+#define SPM_PROJECT_KEY         0x0b160001u
+#define SPM_PWR_STATUS          0x180
+#define SPM_PWR_STATUS_2ND      0x184
+/* MT6768 SPM domains (clk-mt6768-pg.c): MFG_ASYNC (no SRAM), MFG, MFG_CORE0, MFG_CORE1 */
+static const struct { uint32_t con, bit; bool hasSram; } gMfgDom[4] = {
+	{ 0x334, 1u << 14, false },
+	{ 0x338, 1u << 11, true  },
+	{ 0x34c, 1u << 12, true  },
+	{ 0x310, 1u << 13, true  },
+};
+#define SPM_MFG_PWR_CON(n)      (gMfgDom[(n)].con)
+#define MFG_STATUS_BIT(n)       (gMfgDom[(n)].bit)
+#define PWR_RST_B               (1u << 0)
+#define PWR_ISO                 (1u << 1)
+#define PWR_ON                  (1u << 2)
+#define PWR_ON_2ND              (1u << 3)
+#define PWR_CLK_DIS             (1u << 4)
+#define PWR_SRAM_PDN            (1u << 8)
+#define PWR_SRAM_PDN_ACK        (1u << 12)
+
+/* infracfg_ao 0x10001000: bus protection for MFG1 */
+#define INFRA_PROT_SET          0x2a0
+#define INFRA_PROT_CLR          0x2a4
+#define INFRA_PROT_STA1         0x228
+#define INFRA_PROT1_SET         0x2a8
+#define INFRA_PROT1_CLR         0x2ac
+#define INFRA_PROT1_STA1        0x258
+#define INFRA_ACP_CON           0x290
+
+/* topckgen 0x10000000 (CLK_CFG_1 mfg_sel), apmixed 0x1000c000 (MFGPLL) for MT6768 */
+#define CK_CFG_UPDATE           0x004
+#define CK_CFG_UPDATE_MFG       (1u << 4)
+#define CK_CFG_0                0x050
+#define CK_CFG_0_SET            0x054
+#define CK_CFG_0_CLR            0x058
+#define CK_MFG_SEL_SHIFT        0
+#define CK_MFG_SEL_MASK         (3u << 0)
+#define CK_MFG_PDN              (1u << 7)
+#define CK_MFG_MFGPLL           1u
+#define CK_MFG_MAINPLL_D5       2u      /* syspll_d3 (364 MHz) */
+#define PLL_MFG_CON0            0x248   /* bit 0 EN */
+#define PLL_MFG_CON1            0x24c
+#define PLL_MFG_PWR_CON0        0x254   /* bit 0 PWR_ON, bit 1 ISO */""",
+        "MappleGPU.cpp: MT6768 SPM, topckgen CLK_CFG_1, apmixed MFGPLL offsets",
+    )
+
+    replace_exact(
+        p,
+        """\tuint64_t pa = rootPA;
+\tfor (int level = 0; level < 3; level++) {""",
+        """\tuint64_t pa = rootPA;
+\tint startLevel = (gpu != NULL && gpu->vaBits() <= 39) ? 1 : 0;
+\tfor (int level = startLevel; level < 3; level++) {""",
+        "MappleGPU.cpp: 3-level page table walk for <=39-bit VA GPUs (G52 35-bit)",
+    )
+
+    replace_exact(
+        p,
+        """#define LK_VGPU_SEL     0x40    /* 900 mV, as LK leaves VGPU on the realme 8i */
+#define LK_VSRAM_SEL    0x50    /* 1000 mV */""",
+        """#define LK_VGPU_SEL     0x30    /* 800 mV, as LK leaves VGPU on SM-A325M */
+#define LK_VSRAM_SEL    0x40    /* 900 mV */""",
+        "MappleGPU.cpp: SM-A325M LK default GPU rails (800/900 mV)",
+    )
+
+    replace_exact(
+        p,
+        """/* MFG1 bus protection steps (infracfg_ao), set in this order on power-off, released in reverse. */
+static const struct { uint32_t set, clr, sta, mask; } gMfgProt[4] = {
+	{ INFRA_PROT1_SET, INFRA_PROT1_CLR, INFRA_PROT1_STA1, 0x18000000 },
+	{ INFRA_PROT_SET, INFRA_PROT_CLR, INFRA_PROT_STA1, 0x00600000 },
+	{ INFRA_PROT_SET, INFRA_PROT_CLR, INFRA_PROT_STA1, 0x02000000 },
+	{ INFRA_PROT1_SET, INFRA_PROT1_CLR, INFRA_PROT1_STA1, 0x20000000 },
+};""",
+        """/* MFG1 bus protection steps (infracfg_ao MT6768), set on power-off, released in reverse. */
+static const struct { uint32_t set, clr, sta, mask; } gMfgProt[2] = {
+	{ INFRA_PROT_SET, INFRA_PROT_CLR, INFRA_PROT_STA1, 0x02000000 },
+	{ INFRA_PROT_SET, INFRA_PROT_CLR, INFRA_PROT_STA1, 0x00600000 },
+};""",
+        "MappleGPU.cpp: MT6768 2-step MFG bus protection",
+    )
+
+    replace_exact(
+        p,
+        """\tset32(fSpm, con, PWR_RST_B);
+\tclr32(fSpm, con, PWR_SRAM_PDN);
+\tif (!pollUs(1000, [&]{ return !(rd32(fSpm, con) & PWR_SRAM_PDN_ACK); })) {
+\t\tsay(out, end, "  MFG%u: no SRAM ack (pwr_con 0x%08x)\\n", n, rd32(fSpm, con));
+\t\treturn false;
+\t}""",
+        """\tset32(fSpm, con, PWR_RST_B);
+\tif (gMfgDom[n].hasSram) {
+\t\tclr32(fSpm, con, PWR_SRAM_PDN);
+\t\tif (!pollUs(1000, [&]{ return !(rd32(fSpm, con) & PWR_SRAM_PDN_ACK); })) {
+\t\t\tsay(out, end, "  MFG%u: no SRAM ack (pwr_con 0x%08x)\\n", n, rd32(fSpm, con));
+\t\t\treturn false;
+\t\t}
+\t}""",
+        "MappleGPU.cpp: skip SRAM_PDN polling for MFG_ASYNC in mtcmosOn",
+    )
+
+    replace_exact(
+        p,
+        """\tif (n == 1) {
+\t\tfor (int i = 0; i < 4; i++) {
+\t\t\twr32(fInfra, gMfgProt[i].set, gMfgProt[i].mask);
+\t\t\tif (!pollUs(1000, [&]{ return (rd32(fInfra, gMfgProt[i].sta) & gMfgProt[i].mask) == gMfgProt[i].mask; })) {
+\t\t\t\t/* the bus did not drain: powering off now could hang it; leave MFG1 on and usable */
+\t\t\t\tsay(out, end, "  MFG1: bus protection step %d not acknowledged (sta 0x%08x), left on\\n", i + 1,
+\t\t\t\t    rd32(fInfra, gMfgProt[i].sta));
+\t\t\t\tprotRelease(i);
+\t\t\t\treturn false;
+\t\t\t}
+\t\t}
+\t}
+\tset32(fSpm, con, PWR_SRAM_PDN);
+\tif (!pollUs(1000, [&]{ return (rd32(fSpm, con) & PWR_SRAM_PDN_ACK) != 0; })) {
+\t\tsay(out, end, "  MFG%u: no SRAM power-down ack\\n", n);
+\t}""",
+        """\tif (n == 1) {
+\t\tfor (int i = 0; i < 2; i++) {
+\t\t\twr32(fInfra, gMfgProt[i].set, gMfgProt[i].mask);
+\t\t\tif (!pollUs(1000, [&]{ return (rd32(fInfra, gMfgProt[i].sta) & gMfgProt[i].mask) == gMfgProt[i].mask; })) {
+\t\t\t\t/* the bus did not drain: powering off now could hang it; leave MFG1 on and usable */
+\t\t\t\tsay(out, end, "  MFG1: bus protection step %d not acknowledged (sta 0x%08x), left on\\n", i + 1,
+\t\t\t\t    rd32(fInfra, gMfgProt[i].sta));
+\t\t\t\tprotRelease(i);
+\t\t\t\treturn false;
+\t\t\t}
+\t\t}
+\t}
+\tif (gMfgDom[n].hasSram) {
+\t\tset32(fSpm, con, PWR_SRAM_PDN);
+\t\tif (!pollUs(1000, [&]{ return (rd32(fSpm, con) & PWR_SRAM_PDN_ACK) != 0; })) {
+\t\t\tsay(out, end, "  MFG%u: no SRAM power-down ack\\n", n);
+\t\t}
+\t}""",
+        "MappleGPU.cpp: 2-step bus prot and hasSram guard in mtcmosOff",
+    )
+
+    replace_exact(
+        p,
+        """static const struct { uint32_t khz, vgpu, vsram; } gMappleOpp[] = {
+\t{ 950000, 90000, 100000 }, { 940000, 89375, 99375 }, { 930000, 88750, 98750 }, { 920000, 88125, 98125 },
+\t{ 910000, 87500, 97500 }, { 900000, 86875, 96875 }, { 890000, 86250, 96250 }, { 880000, 85625, 95625 },
+\t{ 870000, 85000, 95000 }, { 860000, 84375, 94375 }, { 850000, 83750, 93750 }, { 840000, 83125, 93125 },
+\t{ 830000, 82500, 92500 }, { 820000, 81875, 91875 }, { 810000, 81250, 91250 }, { 800000, 80625, 90625 },
+\t{ 790000, 80000, 90000 }, { 775000, 79375, 89375 }, { 761000, 78750, 88750 }, { 746000, 78125, 88125 },
+\t{ 732000, 77500, 87500 }, { 718000, 76875, 86875 }, { 703000, 76250, 86250 }, { 689000, 75625, 85625 },
+\t{ 675000, 75000, 85000 }, { 660000, 74375, 85000 }, { 646000, 73750, 85000 }, { 631000, 73125, 85000 },
+\t{ 617000, 72500, 85000 }, { 603000, 71875, 85000 }, { 588000, 71250, 85000 }, { 574000, 70625, 85000 },
+\t{ 560000, 70000, 85000 }, { 543000, 69375, 85000 }, { 527000, 68750, 85000 }, { 511000, 68125, 85000 },
+\t{ 495000, 67500, 85000 }, { 478000, 66875, 85000 }, { 462000, 66250, 85000 }, { 446000, 65625, 85000 },
+\t{ 430000, 65000, 85000 }, { 413000, 64375, 85000 }, { 397000, 63750, 85000 }, { 381000, 63125, 85000 },
+\t{ 365000, 62500, 85000 }, { 348000, 61875, 85000 }, { 332000, 61250, 85000 }, { 316000, 60625, 85000 },
+\t{ 300000, 60000, 85000 },
+};""",
+        """static const struct { uint32_t khz, vgpu, vsram; } gMappleOpp[] = {
+\t{ 950000, 90000, 100000 }, { 925000, 87500, 97500 }, { 900000, 85000, 95000 }, { 875000, 82500, 92500 },
+\t{ 850000, 80000, 90000 }, { 823000, 79375, 89375 }, { 796000, 78125, 88125 }, { 769000, 76875, 86875 },
+\t{ 743000, 75625, 85625 }, { 716000, 75000, 85000 }, { 690000, 73750, 85000 }, { 663000, 72500, 85000 },
+\t{ 637000, 71250, 85000 }, { 611000, 70625, 85000 }, { 586000, 70000, 85000 }, { 560000, 69375, 85000 },
+\t{ 535000, 68750, 85000 }, { 509000, 68125, 85000 }, { 484000, 66875, 85000 }, { 467000, 66875, 85000 },
+\t{ 450000, 66250, 85000 }, { 434000, 65625, 85000 }, { 417000, 65000, 85000 }, { 400000, 64375, 85000 },
+\t{ 383000, 64375, 85000 }, { 366000, 63750, 85000 }, { 349000, 63125, 85000 }, { 332000, 62500, 85000 },
+\t{ 315000, 61875, 85000 }, { 299000, 61250, 85000 },
+};""",
+        "MappleGPU.cpp: MT6768 SEG_GPU_DVFS OPP table",
+    )
+
+    replace_exact(
+        p,
+        """\t/* clock gate, then the mfgcfg setup gpufreq does after power on */
+\twr32(fMfgcfg, MFG_CG_CLR, MFG_CG_BG3D);
+\tset32(fMfgcfg, MFG_ASYNC_CON, (1u << 22) | (1u << 23) | (1u << 24) | (1u << 25));
+\tclr32(fMfgcfg, MFG_GLOBAL_CON, (1u << 10) | (1u << 9));
+\tset32(fMfgcfg, MFG_QCHANNEL_CON, 1u << 4);
+\tclr32(fMfgcfg, MFG_GLOBAL_CON, (1u << 19) | (1u << 8));
+\tset32(fMfgcfg, MFG_ASYNC_CON_1, 1u << 0);
+\tset32(fMfgcfg, MFG_I2M_PROTECTOR, 1u << 0);
+\twr32(fMfgcfg, MFG_TIMESTAMP, 1);
+\tif (!fAcpDone) {
+\t\tset32(fInfra, INFRA_ACP_CON, 1u << 9);
+\t\tfAcpDone = true;
+\t}
+\tsay(out, end, "mfgcfg: cg 0x%08x async 0x%08x/0x%08x global 0x%08x qchannel 0x%08x\\n",
+\t    rd32(fMfgcfg, MFG_CG_CON), rd32(fMfgcfg, MFG_ASYNC_CON), rd32(fMfgcfg, MFG_ASYNC_CON_1),
+\t    rd32(fMfgcfg, MFG_GLOBAL_CON), rd32(fMfgcfg, MFG_QCHANNEL_CON));""",
+        """\t/* MT6768 mfgcfg: ungate BG3D only (no MT6781 async/global/qchannel/I2M/ACP regs) */
+\twr32(fMfgcfg, MFG_CG_CLR, MFG_CG_BG3D);
+\tsay(out, end, "mfgcfg: cg 0x%08x\\n", rd32(fMfgcfg, MFG_CG_CON));""",
+        "MappleGPU.cpp: MT6768 mfgOn (BG3D CG_CLR only)",
+    )
+
+    replace_exact(
+        p,
+        """\tif ((st & MFG_STATUS_BIT(0)) && (st & MFG_STATUS_BIT(1))) {
+\t\t/* wait for the GPU bus to go idle */
+\t\twr32(fMfgcfg, MFG_QCHANNEL_CON, 1);
+\t\twr32(fMfgcfg, MFG_BUS_IDLE_CON, 3);
+\t\tif (!pollUs(10000, [&]{ return (rd32(fMfgcfg, MFG_BUS_IDLE_STA) & (1u << 2)) != 0; })) {
+\t\t\tsay(out, end, "  bus not idle (0x%08x)\\n", rd32(fMfgcfg, MFG_BUS_IDLE_STA));
+\t\t}
+\t\twr32(fMfgcfg, MFG_CG_SET, MFG_CG_BG3D);
+\t}""",
+        """\tif ((st & MFG_STATUS_BIT(0)) && (st & MFG_STATUS_BIT(1))) {
+\t\twr32(fMfgcfg, MFG_CG_SET, MFG_CG_BG3D);
+\t}""",
+        "MappleGPU.cpp: MT6768 mfgOff (BG3D CG_SET only)",
+    )
+
+    replace_exact(
+        p,
+        """\tif ((s1 & s2 & MFG_STATUS_BIT(0)) && (s1 & s2 & MFG_STATUS_BIT(1))) {
+\t\tsay(out, end, "mfgcfg: cg 0x%08x async 0x%08x global 0x%08x qchannel 0x%08x\\n", rd32(fMfgcfg, MFG_CG_CON),
+\t\t    rd32(fMfgcfg, MFG_ASYNC_CON), rd32(fMfgcfg, MFG_GLOBAL_CON), rd32(fMfgcfg, MFG_QCHANNEL_CON));
+\t}""",
+        """\tif ((s1 & s2 & MFG_STATUS_BIT(0)) && (s1 & s2 & MFG_STATUS_BIT(1))) {
+\t\tsay(out, end, "mfgcfg: cg 0x%08x\\n", rd32(fMfgcfg, MFG_CG_CON));
+\t}""",
+        "MappleGPU.cpp: MT6768 mfgDump (MFG_CG_CON only)",
+    )
+
+    replace_exact(
+        p,
+        """\treadFeatures();
+\t/* Panfrost's quirks for G57: TTRX_2968/TTRX_3162 varying algorithm (all revisions), IDVS group size */
+\twr(GPU_SHADER_CONFIG, rd(GPU_SHADER_CONFIG) | SC_VAR_ALGORITHM);
+\twr(GPU_JM_CONFIG, rd(GPU_JM_CONFIG) | JM_IDVS_GROUP_SIZE(0xf));
+\twr(GPU_COHERENCY_ENABLE, COHERENCY_NONE);""",
+        """\treadFeatures();
+\tif ((fGpuId >> 28) >= 9) {
+\t\t/* Panfrost's quirks for Valhall G57: TTRX_2968/TTRX_3162 varying algorithm, IDVS group size */
+\t\twr(GPU_SHADER_CONFIG, rd(GPU_SHADER_CONFIG) | SC_VAR_ALGORITHM);
+\t\twr(GPU_JM_CONFIG, rd(GPU_JM_CONFIG) | JM_IDVS_GROUP_SIZE(0xf));
+\t} else {
+\t\t/* Bifrost (Mali-G52): no JS_FLUSH_ID_NEXT, and floor THREAD_TLS_ALLOC at THREAD_MAX_THREADS */
+\t\tfFlushReduce = false;
+\t\tif (fThreadTlsAlloc < fThreadMaxThreads) {
+\t\t\tfThreadTlsAlloc = fThreadMaxThreads;
+\t\t}
+\t}
+\twr(GPU_COHERENCY_ENABLE, COHERENCY_NONE);""",
+        "MappleGPU.cpp: Bifrost quirks/TLS floor/flush-reduce off in maliInit",
+    )
+
+    replace_exact(
+        p,
+        """\tif ((fMmuFeatures & 0xff) != 48) {
+\t\tsay(out, end, "warning: MMU reports %u VA bits, page tables assume 48\\n", fMmuFeatures & 0xff);
+\t}""",
+        """\tif (vaBits() < 35 || vaBits() > 48) {
+\t\tsay(out, end, "warning: MMU reports %u VA bits, unsupported\\n", fMmuFeatures & 0xff);
+\t}""",
+        "MappleGPU.cpp: validate 35..48 VA bits in maliInit",
+    )
+
+    replace_exact(
+        p,
+        """\tuint64_t region;
+\tif (size == 0 || size >= (1ull << 48)) {
+\t\tregion = 47;    /* the whole 48-bit space */""",
+        """\tuint64_t region;
+\tuint32_t bits = vaBits();
+\tif (size == 0 || size >= (1ull << bits)) {
+\t\tregion = bits - 1;    /* the whole VA space */""",
+        "MappleGPU.cpp: use vaBits() in asLock",
+    )
+
+    replace_exact(
+        p,
+        """\twr(AS_BASE(as) + AS_TRANSCFG_LO, TRANSCFG_ADRMODE_AARCH64_4K | TRANSCFG_INA_BITS(55 - 48) |
+\t    TRANSCFG_PTW_MEMATTR_WB | TRANSCFG_PTW_RA);""",
+        """\twr(AS_BASE(as) + AS_TRANSCFG_LO, TRANSCFG_ADRMODE_AARCH64_4K | TRANSCFG_INA_BITS(55 - vaBits()) |
+\t    TRANSCFG_PTW_MEMATTR_WB | TRANSCFG_PTW_RA);""",
+        "MappleGPU.cpp: use vaBits() for TRANSCFG_INA_BITS in asProgram",
+    )
+
+    replace_exact(
+        p,
+        """\tsnprintf(v->name, sizeof(v->name), "Mali-G57 MC%u", (unsigned)__builtin_popcountll(fShaderPresent));""",
+        """\tsnprintf(v->name, sizeof(v->name), "%s MC%u", (fGpuId >> 16) == 0x7402 ? "Mali-G52" : "Mali-G57",
+\t    (unsigned)__builtin_popcountll(fShaderPresent));""",
+        "MappleGPU.cpp: report Mali-G52 in getVersion",
+    )
+
+    replace_exact(
+        p,
+        """\tw[4] = (2u << 1) | (1u << 16);          /* job header: type WRITE_VALUE, index 1, no next */""",
+        """\tw[4] = (2u << 1) | ((fGpuId >> 28) < 9 ? 1u : 0u) | (1u << 16);  /* WRITE_VALUE, is_64b on Bifrost, index 1 */""",
+        "MappleGPU.cpp: set is_64b bit for Bifrost in selftest job header",
+    )
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("Usage: apply_a32_overlay.py <path/to/xnu>")
@@ -741,6 +1095,7 @@ def main():
     patch_pmic(xnu)
     patch_framebuffer(xnu)
     patch_usb_link(xnu)
+    patch_gpu_mt6768(xnu)
     print("Overlay applied cleanly!")
 
 
