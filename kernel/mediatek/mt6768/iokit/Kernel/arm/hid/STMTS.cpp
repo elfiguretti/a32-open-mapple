@@ -136,11 +136,20 @@ STMTS::getWorkLoop(void) const
 bool
 STMTS::sendCmd(const uint8_t *cmd, uint32_t len)
 {
-	IOReturn kr = fBus->transfer(fAddr, cmd, len, NULL, 0);
-	if (kr != kIOReturnSuccess) {
-		IOLog("TOUCH: FTS5CU56A command 0x%02x failed (0x%x)\n", cmd[0], kr);
+	IOReturn kr = kIOReturnIOError;
+	// A write can finish without an MCU completion IRQ. These setup commands
+	// can be repeated, so retry them before abandoning the controller probe.
+	for (int attempt = 0; attempt < 3; attempt++) {
+		if (attempt != 0) {
+			IOSleep(5);
+		}
+		kr = fBus->transfer(fAddr, cmd, len, NULL, 0);
+		if (kr == kIOReturnSuccess) {
+			return true;
+		}
 	}
-	return kr == kIOReturnSuccess;
+	IOLog("TOUCH: FTS5CU56A command 0x%02x failed (0x%x)\n", cmd[0], kr);
+	return false;
 }
 
 IOReturn
