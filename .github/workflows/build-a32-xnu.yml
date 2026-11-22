@@ -148,8 +148,8 @@ jobs:
             --check-abs upstream/mapple_build/tools/check-abs.py \
             --out dist/shim-a32.Image
 
-          # 3) Pack MAPPLEPL payload (Hito 3+4+5 live silicon test: tear-free AMOLED + MT6358 + FTS5CU56A + read-only MSDC0 eMMC GPT probe)
-          CMDLINE="mp_mem4g=0 mp_cpufreq=0 mp_therm=0 mp_gpu=0 mp_touch=1 mp_wifi_steps=0 mp_bt_steps=0 mp_fb_noconsole=0 mp_conlog=1 rd=emmc0 mp_emmcroot=boot cpus=4 debug=0x14e serial=3 -v ${{ inputs.extra_cmdline }}"
+          # 3) Pack MAPPLEPL payload (Hito 4+5 iOS 16.7.16 boot on xnusys eMMC, 8 CPUs, CPU rendering, FTS5CU56A touch)
+          CMDLINE="rd=emmc0 mp_emmcroot=xnusys mp_rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 wdt_test=no_user_checkin mp_mem4g=0 mp_cpufreq=0 mp_therm=0 mp_gpu=0 mp_touch=1 mp_wifi_steps=0 mp_bt_steps=0 mp_fb_noconsole=1 mp_conlog=0 cpus=8 debug=0xc serial=3 -v ${{ inputs.extra_cmdline }}"
           python3 upstream/mapple_build/tools/mkpayload.py dist/kernel dist/a32.adt dist/xnu-a32.bin --cmdline "$CMDLINE"
           echo "$CMDLINE" > dist/cmdline.txt
 

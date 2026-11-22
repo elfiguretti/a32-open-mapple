@@ -75,6 +75,7 @@ static bool emmc_writable;
 static uint64_t emmc_lba;
 static uint64_t emmc_blocks;
 static uint64_t emmc_part_blocks;               /* full GPT partition size (tail Wi-Fi FW) */
+static uint32_t emmc_secsize = 512u;            /* logical sector size (512..4096 via DKIOCSETBLOCKSIZE) */
 static int emmc_bmajor = -1;
 static int emmc_cmajor = -1;
 static dev_t emmc_bdev;
@@ -460,39 +461,55 @@ mtk_emmc_close(__unused dev_t dev, __unused int flags, __unused int devtype, __u
 static void
 mtk_emmc_strategy(buf_t bp)
 {
-	uint64_t block = (uint64_t)buf_blkno(bp);
+	uint64_t off = (uint64_t)buf_blkno(bp) * emmc_secsize;
+	uint64_t part_bytes = emmc_blocks * 512ULL;
 	uint32_t count = buf_count(bp);
 	uint32_t done = 0;
-	uint8_t *data = (uint8_t *)buf_dataptr(bp);
+	caddr_t vaddr = NULL;
 	bool is_read = (buf_flags(bp) & B_READ) != 0;
 	int error = 0;
 
+	buf_setresid(bp, count);
 	if (!is_read && !emmc_writable) {
 		error = EROFS;
 		goto out;
 	}
-	if (block >= emmc_blocks) {
-		buf_setresid(bp, count);
-		error = (block == emmc_blocks) ? 0 : EINVAL;
+	if (off >= part_bytes) {
+		error = (off == part_bytes) ? 0 : EINVAL;
 		goto out;
 	}
-	if (count > (emmc_blocks - block) * 512ULL) {
-		count = (uint32_t)((emmc_blocks - block) * 512ULL);
+	if (count == 0) {
+		goto out;
 	}
+	if ((uint64_t)count > part_bytes - off) {
+		count = (uint32_t)(part_bytes - off);
+	}
+	/* Cluster I/O (UPL) buffers have NULL buf_dataptr(bp); buf_map maps them safely! */
+	if (buf_map(bp, &vaddr) != 0 || vaddr == NULL) {
+		error = EIO;
+		goto out;
+	}
+	uint8_t *data = (uint8_t *)vaddr;
 
 	lck_mtx_lock(&mtk_emmc_lock);
 	while (done < count && error == 0) {
-		uint32_t blks = (count - done) / 512u;
-		uint64_t cur_lba = emmc_lba + block + (done / 512u);
+		uint64_t cur_off = off + done;
+		uint64_t cur_lba = emmc_lba + (cur_off / 512ULL);
+		uint32_t sub = (uint32_t)(cur_off % 512ULL);
+		uint32_t rem = count - done;
+		uint32_t blks = (sub == 0) ? (rem / 512u) : 0u;
 
 		if (is_read) {
 			if (blks == 0 || (((uintptr_t)(data + done)) & 3u) != 0) {
-				uint32_t n = (count - done) < 512u ? (count - done) : 512u;
+				uint32_t n = 512u - sub;
+				if (n > rem) {
+					n = rem;
+				}
 				if (!emmc_read_retrying(cur_lba, 1u, emmc_sector)) {
 					error = EIO;
 					break;
 				}
-				memcpy(data + done, emmc_sector, n);
+				memcpy(data + done, (const uint8_t *)emmc_sector + sub, n);
 				done += n;
 				continue;
 			}
@@ -506,14 +523,17 @@ mtk_emmc_strategy(buf_t bp)
 			done += blks * 512u;
 		} else {
 			if (blks == 0 || (((uintptr_t)(data + done)) & 3u) != 0) {
-				uint32_t n = (count - done) < 512u ? (count - done) : 512u;
-				if (n < 512u) {
+				uint32_t n = 512u - sub;
+				if (n > rem) {
+					n = rem;
+				}
+				if (sub != 0 || n < 512u) {
 					if (!emmc_read_retrying(cur_lba, 1u, emmc_sector)) {
 						error = EIO;
 						break;
 					}
 				}
-				memcpy(emmc_sector, data + done, n);
+				memcpy((uint8_t *)emmc_sector + sub, data + done, n);
 				if (!emmc_write_blocks(cur_lba, 1u, emmc_sector)) {
 					error = EIO;
 					break;
@@ -532,10 +552,11 @@ mtk_emmc_strategy(buf_t bp)
 		}
 	}
 	lck_mtx_unlock(&mtk_emmc_lock);
+	buf_unmap(bp);
 	buf_setresid(bp, buf_count(bp) - done);
 	if (error != 0) {
-		printf("emmc: %s blk %llu (%u B) failed: %s (%#x)\n",
-		    is_read ? "read" : "write", block, count,
+		printf("emmc: %s off %llu (%u B) failed: %s (%#x)\n",
+		    is_read ? "read" : "write", off, count,
 		    emmc_failed ? emmc_failed : "?", emmc_failed_status);
 	}
 out:
@@ -550,19 +571,37 @@ mtk_emmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag,
 {
 	switch (cmd) {
 	case DKIOCGETBLOCKSIZE:
+		*(uint32_t *)data = emmc_secsize;
+		return 0;
+	case DKIOCSETBLOCKSIZE: {
+		uint32_t bs = *(uint32_t *)data;
+		if (bs < 512u || bs > 4096u || (bs & (bs - 1u)) != 0) {
+			return EINVAL;
+		}
+		emmc_secsize = bs;
+		return 0;
+	}
+	case DKIOCGETPHYSICALBLOCKSIZE:
 		*(uint32_t *)data = 512u;
 		return 0;
-	case DKIOCSETBLOCKSIZE:
-		return *(uint32_t *)data == 512u ? 0 : EINVAL;
 	case DKIOCGETBLOCKCOUNT:
-		*(uint64_t *)data = emmc_blocks;
+		*(uint64_t *)data = (emmc_blocks * 512ULL) / emmc_secsize;
 		return 0;
 	case DKIOCISWRITABLE:
 		*(uint32_t *)data = emmc_writable ? 1u : 0u;
 		return 0;
+	case DKIOCSYNCHRONIZE:
+	case DKIOCSYNCHRONIZECACHE:
+		return 0;
 	case DKIOCGETMAXBLOCKCOUNTREAD:
+		*(uint64_t *)data = (EMMC_MAX_BLOCKS * 512ULL) / emmc_secsize;
+		return 0;
 	case DKIOCGETMAXBLOCKCOUNTWRITE:
-		*(uint64_t *)data = EMMC_MAX_BLOCKS;
+		*(uint64_t *)data = emmc_writable ? ((EMMC_MAX_BLOCKS * 512ULL) / emmc_secsize) : 0ULL;
+		return 0;
+	case DKIOCGETMAXSEGMENTCOUNTREAD:
+	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+		*(uint64_t *)data = 1ULL;
 		return 0;
 	default:
 		return ENOTTY;
