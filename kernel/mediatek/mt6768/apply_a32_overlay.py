@@ -1076,9 +1076,73 @@ static const struct { uint32_t set, clr, sta, mask; } gMfgProt[2] = {
 
     replace_exact(
         p,
-        """\tw[4] = (2u << 1) | (1u << 16);          /* job header: type WRITE_VALUE, index 1, no next */""",
-        """\tw[4] = (2u << 1) | ((fGpuId >> 28) < 9 ? 1u : 0u) | (1u << 16);  /* WRITE_VALUE, is_64b on Bifrost, index 1 */""",
-        "MappleGPU.cpp: set is_64b bit for Bifrost in selftest job header",
+        """extern "C" void mt6781_cpufreq_boost_stats(int *on, uint64_t *starts, uint64_t *ms, uint64_t *signals);  /* 0183 */""",
+        """extern "C" void mt6781_cpufreq_boost_stats(int *on, uint64_t *starts, uint64_t *ms, uint64_t *signals);  /* 0183 */
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);""",
+        "MappleGPU.cpp: declare ml_io_map for MT6768 sysirq INTPOL",
+    )
+
+    replace_exact(
+        p,
+        """\tfor (int i = 0; i < 3; i++) {
+\t\t/* the job interrupt has a filter: K0e fast kick and the interrupt timestamps */""",
+        """\t/* MT6768 intpol-controller (0x0c53a650): Mali SPIs 0x112..0x114 (274..276) are active-LOW */
+\tif (vm_offset_t intpol = ml_io_map(0x0c53a000ull, 0x1000)) {
+\t\tset32(intpol, 0x670, 7u << 18);
+\t\t__asm__ volatile ("dsb sy" : : : "memory");
+\t}
+\tfor (int i = 0; i < 3; i++) {
+\t\t/* the job interrupt has a filter: K0e fast kick and the interrupt timestamps */""",
+        "MappleGPU.cpp: invert MT6768 Mali SPIs 274..276 in sysirq INTPOL",
+    )
+
+    replace_exact(
+        p,
+        """\tvolatile uint32_t *w = (volatile uint32_t *)mem->getBytesNoCopy();
+\tuint64_t target = fault ? bo->va + (64ull << 20) : bo->va + 0x200;       /* fault: an unmapped address */
+\tuint32_t value = 0xc0ffee00u | (uint32_t)(fJobs & 0xff);
+\tfor (int i = 0; i < 256; i++) {
+\t\tw[i] = 0;
+\t}
+\tw[4] = (2u << 1) | (1u << 16);          /* job header: type WRITE_VALUE, index 1, no next */
+\tw[8] = (uint32_t)target;                /* payload: address */
+\tw[9] = (uint32_t)(target >> 32);
+\tw[10] = 6;                              /* IMMEDIATE_32 */
+\tw[12] = value;
+\t__asm__ volatile ("dsb sy" : : : "memory");
+
+\tuint64_t t0 = nowMs(), mmu0 = fMmuFaults, resets0 = fResets;
+\tif (count > 1) {
+\t\tobjectCounts(out, end, "before");
+\t}
+\tMappleGPUFence *fence = NULL;
+\tOSArray *bos = NULL;
+\tIOReturn ret = kIOReturnSuccess;
+\t/* count > 1: the same job again, each with its own fence and BO list as a client's submit has */
+\tfor (uint32_t k = 0; k < count && ret == kIOReturnSuccess; k++) {""",
+        """\tvolatile uint32_t *w = (volatile uint32_t *)mem->getBytesNoCopy();
+\tuint64_t target = fault ? bo->va + (64ull << 20) : bo->va + 0x200;       /* fault: an unmapped address */
+\tuint32_t value = 0xc0ffee00u | (uint32_t)(fJobs & 0xff);
+
+\tuint64_t t0 = nowMs(), mmu0 = fMmuFaults, resets0 = fResets;
+\tif (count > 1) {
+\t\tobjectCounts(out, end, "before");
+\t}
+\tMappleGPUFence *fence = NULL;
+\tOSArray *bos = NULL;
+\tIOReturn ret = kIOReturnSuccess;
+\t/* count > 1: the same job again, each with its own fence and BO list as a client's submit has */
+\tfor (uint32_t k = 0; k < count && ret == kIOReturnSuccess; k++) {
+\t\tfor (int i = 0; i < 256; i++) {
+\t\t\tw[i] = 0;
+\t\t}
+\t\tw[4] = (2u << 1) | ((fGpuId >> 28) < 9 ? 1u : 0u) | (1u << 16);  /* WRITE_VALUE, is_64b on Bifrost, index 1 */
+\t\tw[8] = (uint32_t)target;                /* payload: address */
+\t\tw[9] = (uint32_t)(target >> 32);
+\t\tw[10] = 6;                              /* IMMEDIATE_32 */
+\t\tw[12] = value;
+\t\t__asm__ volatile ("dsb sy" : : : "memory");""",
+        "MappleGPU.cpp: reset Bifrost selftest job header per iteration and set is_64b",
     )
 
 
