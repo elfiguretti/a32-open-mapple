@@ -5,20 +5,20 @@
  * Matches /arm-io/i2c6/touch ("stm,stm_ts"), published as a MappleDTNub child
  * of MTKI2C (bus 6 @ 0x1100d000, APDMA @ 0x11000600).
  *
- * Hardware & protocol verified live on SM-A325M silicon (2026-11-22):
+ * Hardware and protocol (SM-A325M live DT and Samsung stm_core.c/stm_fn.c):
  *   - Power rails:
  *       * tsp_avdd_ldo (3.0V): MT6358 VCAMA2 (ANA_CON0 0x1e0c = 0x0c00, CON0 0x1c88 bit 0 = 1)
  *       * tsp_io_ldo   (1.8V): GPIO 4 output HIGH (fixed_regulator@0)
  *   - I2C 7-bit address: 0x49 on bus 6 (400 kHz)
- *   - IRQ: EINT/GPIO 10, falling edge (active-low while FIFO non-empty)
+ *   - IRQ: EINT/GPIO 10, active low while the FIFO is non-empty
  *   - Flash-resident firmware (fts5cu56a_a32.bin, verified live: id=535448 fw=02.54.00.16)
  *   - Commands:
  *       0x22 READ_DEVICE_ID   (3 bytes -> 53 54 48)
  *       0x24 READ_FW_VERSION  (4 bytes -> 02 54 00 16)
  *       0x62 CLEAR_ALL_EVENT  (0 bytes)
  *       0x10 SENSE_ON         (0 bytes)
- *       0x60 READ_ONE_EVENT   (16 bytes via I2C6 APDMA — MUST read all 16 bytes
- *                              in a single transaction to pop the IC FIFO!)
+ *       0x60 READ_ONE_EVENT   (16 bytes in one I2C transaction)
+ *       0x61 READ_ALL_EVENT   (16 bytes per remaining event in the FIFO)
  *   - Coordinate event layout (stm_ts_event_coordinate, 16 bytes):
  *       b[0]: eid[1:0] (0 = coordinate), tid[5:2] (0..9), tchsta[7:6] (1=ENTER, 2=MOVE, 3=LEAVE)
  *       b[1]: x[11:4]
@@ -32,6 +32,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOInterruptEventSource.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <pexpert/pexpert.h>
 #include "MappleHIDTouch.h"
 #include "../MTKIO.h"
@@ -42,14 +43,28 @@ extern "C" int mapple_gpio_set(uint32_t pin, int high);
 #define STM_CMD_SENSE_ON        0x10
 #define STM_CMD_READ_ID         0x22
 #define STM_CMD_READ_FW_VER     0x24
+#define STM_CMD_TOUCH_TYPE      0x30
+#define STM_CMD_OP_MODE         0x31
 #define STM_CMD_READ_ONE_EVENT  0x60
+#define STM_CMD_READ_ALL_EVENT  0x61
 #define STM_CMD_CLEAR_ALL_EVENT 0x62
+#define STM_CMD_SCAN_MODE       0xa0
+
+#define STM_TOUCH_TYPE_DEFAULT  0x61  /* Touch, palm and wet */
+#define STM_OP_MODE_NORMAL      0x00
+#define STM_SCAN_MODE_DEFAULT   0x01  /* Mutual and self sensing */
+#define STM_ECHO_EVENT          0x43
+#define STM_ECHO_STATUS         0x01
 
 #define STM_EVENT_SIZE          16
 #define STM_EID_COORDINATE      0x00
 #define STM_EID_STATUS          0x01
+#define STM_STATUS_ERROR        0x01
+#define STM_STATUS_INFO         0x02
+#define STM_ERROR_QUEUE_FULL    0x01
+#define STM_INFO_READY          0x00
+#define STM_READY_RESET         0x10
 
-#define STM_TCHSTA_ENTER        1
 #define STM_TCHSTA_MOVE         2
 #define STM_TCHSTA_LEAVE        3
 
@@ -71,22 +86,27 @@ protected:
 	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString("FTS5CU56A"); }
 private:
 	static void interruptOccurred(OSObject *owner, IOInterruptEventSource *src, int count);
+	static void retryInterrupt(OSObject *owner, IOTimerEventSource *timer);
 	void powerOn(void);
-	void drainEvents(void);
-	void handleEvent(void);
+	bool startScanning(void);
+	void readEvents(void);
+	void handleEvent(const uint8_t *ev);
 	void releaseAll(void);
-	IOReturn sendCmd(uint8_t cmd);
+	bool sendCmd(const uint8_t *cmd, uint32_t len);
 	IOReturn readCmd(uint8_t cmd, uint8_t *buf, uint32_t len);
+	IOReturn readBatch(uint8_t (&events)[STM_MAX_EVENTS_PER_IRQ][STM_EVENT_SIZE], uint32_t &count);
 
 	MTKI2C *fBus;
 	IOWorkLoop *fWorkLoop;
 	IOInterruptEventSource *fInterrupt;
+	IOTimerEventSource *fRetryTimer;
 	uint8_t fAddr;
 	uint32_t fMaxX, fMaxY;
 	uint32_t fPanelW, fPanelH;
 	uint32_t fActiveMask;
 	uint32_t fErrors;
 	uint32_t fLogCount;
+	bool fSawInterrupt;
 };
 
 OSDefineMetaClassAndStructors(STMTS, MappleHIDTouch);
@@ -104,16 +124,35 @@ STMTS::getWorkLoop(void) const
 	return fWorkLoop;
 }
 
-IOReturn
-STMTS::sendCmd(uint8_t cmd)
+bool
+STMTS::sendCmd(const uint8_t *cmd, uint32_t len)
 {
-	return fBus->transfer(fAddr, &cmd, 1, NULL, 0);
+	IOReturn kr = fBus->transfer(fAddr, cmd, len, NULL, 0);
+	if (kr != kIOReturnSuccess) {
+		IOLog("TOUCH: FTS5CU56A command 0x%02x failed (0x%x)\n", cmd[0], kr);
+	}
+	return kr == kIOReturnSuccess;
 }
 
 IOReturn
 STMTS::readCmd(uint8_t cmd, uint8_t *buf, uint32_t len)
 {
 	return fBus->transfer(fAddr, &cmd, 1, buf, len);
+}
+
+IOReturn
+STMTS::readBatch(uint8_t (&events)[STM_MAX_EVENTS_PER_IRQ][STM_EVENT_SIZE], uint32_t &count)
+{
+	count = 0;
+	IOReturn kr = readCmd(STM_CMD_READ_ONE_EVENT, events[0], STM_EVENT_SIZE);
+	if (kr != kIOReturnSuccess || events[0][0] == 0) {
+		return kr;
+	}
+	count = 1 + (events[0][7] & 0x1fu);
+	if (count > 1) {
+		kr = readCmd(STM_CMD_READ_ALL_EVENT, events[1], (count - 1) * STM_EVENT_SIZE);
+	}
+	return kr;
 }
 
 void
@@ -145,21 +184,48 @@ STMTS::powerOn(void)
 	IOSleep(100);
 }
 
-void
-STMTS::drainEvents(void)
+bool
+STMTS::startScanning(void)
 {
-	for (uint32_t i = 0; i < STM_MAX_EVENTS_PER_IRQ; i++) {
-		uint8_t ev[STM_EVENT_SIZE] = { 0 };
-		if (readCmd(STM_CMD_READ_ONE_EVENT, ev, sizeof(ev)) != kIOReturnSuccess) {
-			break;
-		}
-		if (ev[0] == 0 && ev[1] == 0 && ev[2] == 0 && ev[3] == 0) {
-			break;
-		}
-		if ((ev[7] & 0x1fu) == 0) {
-			break;
-		}
+	const uint8_t clear[] = { STM_CMD_CLEAR_ALL_EVENT };
+	const uint8_t normal[] = { STM_CMD_OP_MODE, STM_OP_MODE_NORMAL };
+	const uint8_t touchType[] = { STM_CMD_TOUCH_TYPE, STM_TOUCH_TYPE_DEFAULT, 0 };
+	const uint8_t senseOn[] = { STM_CMD_SENSE_ON };
+	const uint8_t scan[] = { STM_CMD_SCAN_MODE, 0, STM_SCAN_MODE_DEFAULT };
+	if (!sendCmd(clear, sizeof(clear)) || !sendCmd(normal, sizeof(normal))) {
+		return false;
 	}
+	IOSleep(5);
+	if (!sendCmd(touchType, sizeof(touchType))) {
+		return false;
+	}
+	IOSleep(10);
+	if (!sendCmd(senseOn, sizeof(senseOn)) || !sendCmd(scan, sizeof(scan))) {
+		return false;
+	}
+	IOSleep(20);
+
+	// Consume the command echoes before arming EINT10.
+	uint8_t events[STM_MAX_EVENTS_PER_IRQ][STM_EVENT_SIZE];
+	for (int attempt = 0; attempt < 12; attempt++) {
+		uint32_t count;
+		IOReturn kr = readBatch(events, count);
+		if (kr != kIOReturnSuccess) {
+			IOLog("TOUCH: FTS5CU56A scan echo read failed (0x%x)\n", kr);
+			break;
+		}
+		for (uint32_t i = 0; i < count; i++) {
+			const uint8_t *ev = events[i];
+			if (ev[0] == STM_ECHO_EVENT && ev[1] == STM_ECHO_STATUS &&
+			    ev[2] == scan[0] && ev[3] == scan[1] && ev[4] == scan[2]) {
+				IOLog("TOUCH: FTS5CU56A scan mode acknowledged\n");
+				return true;
+			}
+		}
+		IOSleep(5);
+	}
+	IOLog("TOUCH: FTS5CU56A scan mode echo missing\n");
+	return true;
 }
 
 bool
@@ -198,38 +264,35 @@ STMTS::start(IOService *provider)
 	IOReturn kr = kIOReturnIOError;
 	for (int attempt = 0; attempt < 5; attempt++) {
 		kr = readCmd(STM_CMD_READ_ID, id, sizeof(id));
-		if (kr == kIOReturnSuccess && (id[0] != 0 || id[1] != 0 || id[2] != 0)) {
+		if (kr == kIOReturnSuccess && id[0] == 0x53 && id[1] == 0x54 && id[2] == 0x48) {
 			break;
 		}
 		IOSleep(30);
 	}
-	if (kr != kIOReturnSuccess) {
-		IOLog("TOUCH: FTS5CU56A at 0x%02x did not answer (kr=0x%x)\n", fAddr, kr);
+	if (kr != kIOReturnSuccess || id[0] != 0x53 || id[1] != 0x54 || id[2] != 0x48) {
+		IOLog("TOUCH: FTS5CU56A at 0x%02x probe failed (kr=0x%x id=%02x%02x%02x)\n",
+		    fAddr, kr, id[0], id[1], id[2]);
 		return false;
 	}
 	(void)readCmd(STM_CMD_READ_FW_VER, fw, sizeof(fw));
 	IOLog("TOUCH: FTS5CU56A at 0x%02x id=%02x%02x%02x fw=%02x.%02x.%02x.%02x\n",
 	    fAddr, id[0], id[1], id[2], fw[0], fw[1], fw[2], fw[3]);
 
-	/* Clear boot/status events, enable capacitive sensing, and drain ack so EINT10 rises HIGH */
-	(void)sendCmd(STM_CMD_CLEAR_ALL_EVENT);
-	IOSleep(10);
-	drainEvents();
-	(void)sendCmd(STM_CMD_SENSE_ON);
-	IOSleep(15);
-	drainEvents();
-
-	if (!MappleHIDTouch::start(provider)) {
+	if (!startScanning()) {
 		return false;
 	}
 	fInterrupt = IOInterruptEventSource::interruptEventSource(this, &STMTS::interruptOccurred, provider, 0);
-	if (fInterrupt == NULL || fWorkLoop->addEventSource(fInterrupt) != kIOReturnSuccess) {
+	fRetryTimer = IOTimerEventSource::timerEventSource(this, &STMTS::retryInterrupt);
+	if (fInterrupt == NULL || fRetryTimer == NULL ||
+	    fWorkLoop->addEventSource(fInterrupt) != kIOReturnSuccess ||
+	    fWorkLoop->addEventSource(fRetryTimer) != kIOReturnSuccess) {
 		IOLog("TOUCH: STMTS failed to attach EINT interrupt\n");
 		return false;
 	}
+	if (!MappleHIDTouch::start(provider)) {
+		return false;
+	}
 	fInterrupt->enable();
-	/* One final drain after enabling IRQ in case an event arrived during startup */
-	drainEvents();
 	IOLog("TOUCH: FTS5CU56A on, coords %ux%u -> panel %ux%u\n", fMaxX, fMaxY, fPanelW, fPanelH);
 	return true;
 }
@@ -239,11 +302,14 @@ STMTS::free(void)
 {
 	if (fInterrupt != NULL) {
 		fInterrupt->disable();
-		if (fWorkLoop != NULL) {
-			fWorkLoop->removeEventSource(fInterrupt);
-		}
+		fWorkLoop->removeEventSource(fInterrupt);
+	}
+	if (fRetryTimer != NULL) {
+		fRetryTimer->cancelTimeout();
+		fWorkLoop->removeEventSource(fRetryTimer);
 	}
 	OSSafeReleaseNULL(fInterrupt);
+	OSSafeReleaseNULL(fRetryTimer);
 	MappleHIDTouch::free();
 	OSSafeReleaseNULL(fWorkLoop);
 }
@@ -251,10 +317,18 @@ STMTS::free(void)
 void
 STMTS::interruptOccurred(OSObject *owner, IOInterruptEventSource *src __unused, int count __unused)
 {
-	STMTS *self = OSDynamicCast(STMTS, owner);
-	if (self != NULL) {
-		self->handleEvent();
+	STMTS *self = static_cast<STMTS *>(owner);
+	if (!self->fSawInterrupt) {
+		self->fSawInterrupt = true;
+		IOLog("TOUCH: FTS5CU56A first EINT10 interrupt\n");
 	}
+	self->readEvents();
+}
+
+void
+STMTS::retryInterrupt(OSObject *owner, IOTimerEventSource *timer __unused)
+{
+	static_cast<STMTS *>(owner)->fInterrupt->enable();
 }
 
 void
@@ -269,63 +343,67 @@ STMTS::releaseAll(void)
 }
 
 void
-STMTS::handleEvent(void)
+STMTS::readEvents(void)
 {
-	for (uint32_t iter = 0; iter < STM_MAX_EVENTS_PER_IRQ; iter++) {
-		uint8_t ev[STM_EVENT_SIZE] = { 0 };
-		if (readCmd(STM_CMD_READ_ONE_EVENT, ev, sizeof(ev)) != kIOReturnSuccess) {
-			if (++fErrors <= 8) {
-				IOLog("TOUCH: FTS5CU56A event read error #%u\n", fErrors);
-			}
-			break;
+	uint8_t events[STM_MAX_EVENTS_PER_IRQ][STM_EVENT_SIZE];
+	uint32_t count;
+	IOReturn kr = readBatch(events, count);
+	if (kr != kIOReturnSuccess || count == 0) {
+		if (++fErrors <= 8) {
+			IOLog("TOUCH: FTS5CU56A EINT10 %s (0x%x)\n",
+			    kr == kIOReturnSuccess ? "with empty FIFO" : "event read failed", kr);
 		}
-		if (ev[0] == 0 && ev[1] == 0 && ev[2] == 0 && ev[3] == 0) {
-			break;
+		if (kr != kIOReturnSuccess) {
+			releaseAll();
 		}
-		uint8_t eid = ev[0] & 0x03u;
-		uint8_t left = ev[7] & 0x1fu;
-
-		if (eid == STM_EID_COORDINATE) {
-			uint8_t tid = (ev[0] >> 2) & 0x0fu;
-			uint8_t tchsta = (ev[0] >> 6) & 0x03u;
-			uint32_t raw_x = ((uint32_t)ev[1] << 4) | ((uint32_t)ev[3] >> 4);
-			uint32_t raw_y = ((uint32_t)ev[2] << 4) | ((uint32_t)ev[3] & 0x0fu);
-
-			if (tid < STM_MAX_FINGERS) {
-				if (raw_x >= fMaxX) {
-					raw_x = fMaxX - 1;
-				}
-				if (raw_y >= fMaxY) {
-					raw_y = fMaxY - 1;
-				}
-				int px = (int)((raw_x * fPanelW) / fMaxX);
-				int py = (int)((raw_y * fPanelH) / fMaxY);
-
-				if (tchsta == STM_TCHSTA_ENTER || tchsta == STM_TCHSTA_MOVE) {
-					if (tchsta == STM_TCHSTA_ENTER && fLogCount < 8) {
-						fLogCount++;
-						IOLog("TOUCH: FTS5CU56A down tid=%u (%d,%d)\n", tid, px, py);
-					}
-					fActiveMask |= (1u << tid);
-					touch((int)tid, true, px, py);
-				} else if (tchsta == STM_TCHSTA_LEAVE) {
-					if (fLogCount < 8) {
-						fLogCount++;
-						IOLog("TOUCH: FTS5CU56A up   tid=%u (%d,%d)\n", tid, px, py);
-					}
-					fActiveMask &= ~(1u << tid);
-					touch((int)tid, false, px, py);
-				}
-			}
-		} else if (eid == STM_EID_STATUS) {
-			/* Controller reset / status notification: clear stuck contacts and re-arm sense if needed. */
-			if (ev[1] == 0x10 && fActiveMask != 0) {
-				releaseAll();
-			}
-		}
-		if (left == 0) {
-			break;
-		}
+		// Keep a stuck active-low line from immediately retriggering on an empty or failed read.
+		fInterrupt->disable();
+		fRetryTimer->setTimeoutMS(20);
+		return;
 	}
+	for (uint32_t i = 0; i < count; i++) {
+		handleEvent(events[i]);
+	}
+}
+
+void
+STMTS::handleEvent(const uint8_t *ev)
+{
+	uint8_t eid = ev[0] & 0x03u;
+	if (eid == STM_EID_STATUS) {
+		uint8_t type = (ev[0] >> 2) & 0x0fu;
+		if (type == STM_STATUS_ERROR && ev[1] == STM_ERROR_QUEUE_FULL) {
+			releaseAll();
+		} else if (type == STM_STATUS_INFO && ev[1] == STM_INFO_READY && ev[2] == STM_READY_RESET) {
+			IOLog("TOUCH: FTS5CU56A reset, restarting scan\n");
+			releaseAll();
+			(void)startScanning();
+		}
+		return;
+	}
+	if (eid != STM_EID_COORDINATE) {
+		return;
+	}
+
+	uint8_t tid = (ev[0] >> 2) & 0x0fu;
+	uint8_t state = ev[0] >> 6;
+	if (tid >= STM_MAX_FINGERS || state == 0) {
+		return;
+	}
+	uint32_t rawX = ((uint32_t)ev[1] << 4) | (ev[3] >> 4);
+	uint32_t rawY = ((uint32_t)ev[2] << 4) | (ev[3] & 0x0fu);
+	int x = (int)(MIN(rawX, fMaxX - 1) * fPanelW / fMaxX);
+	int y = (int)(MIN(rawY, fMaxY - 1) * fPanelH / fMaxY);
+	bool down = state != STM_TCHSTA_LEAVE;
+	if (state != STM_TCHSTA_MOVE && fLogCount < 8) {
+		fLogCount++;
+		IOLog("TOUCH: FTS5CU56A %s tid=%u (%d,%d)\n", down ? "down" : "up", tid, x, y);
+	}
+	if (down) {
+		fActiveMask |= 1u << tid;
+	} else {
+		fActiveMask &= ~(1u << tid);
+	}
+	touch(tid, down, x, y);
 }
 #endif /* MT6781 */

@@ -541,7 +541,8 @@ def patch_i2c_dma(xnu: Path):
         "\tIOBufferMemoryDescriptor *fDmaDesc;\n"
         "\tIOMemoryMap            *fDmaMap;\n"
         "\tvolatile uint8_t       *fDmaBuf;\n"
-        "\tuint64_t                fDmaPa;\n};",
+        "\tuint64_t                fDmaPa;\n"
+        "\tbool                    fTransferActive;\n};",
         "MTKIO.h: add APDMA fields to MTKI2C",
     )
 
@@ -585,11 +586,26 @@ def patch_i2c_dma(xnu: Path):
         "\tif (addr > 0x7f || wlen == 0 || wlen > kFIFOSize || rlen > kFIFOSize || (rlen && rbuf == NULL)) {\n"
         "\t\treturn kIOReturnBadArgument;\n"
         "\t}",
-        "\tuint32_t maxR = (fDmaRegs != 0 && fDmaBuf != NULL) ? 64u : (uint32_t)kFIFOSize;\n"
+        "\t/* FTS5CU56A can return 31 queued 16-byte events in a single read. */\n"
+        "\tuint32_t maxR = (fDmaRegs != 0 && fDmaBuf != NULL) ? 512u : (uint32_t)kFIFOSize;\n"
         "\tif (addr > 0x7f || wlen == 0 || wlen > kFIFOSize || rlen > maxR || (rlen && rbuf == NULL)) {\n"
         "\t\treturn kIOReturnBadArgument;\n"
         "\t}",
-        "MTKIO.cpp: allow up to 64-byte reads when APDMA is configured",
+        "MTKIO.cpp: allow up to 512-byte reads when APDMA is configured",
+    )
+    replace_exact(
+        c,
+        "\t\treturn transferGated(addr, wbuf, wlen, rbuf, rlen);",
+        "\t\t/* commandSleep(&fDone) drops the gate while waiting for the I2C IRQ. */\n"
+        "\t\twhile (fTransferActive) {\n"
+        "\t\t\tfGate->commandSleep(&fTransferActive, THREAD_UNINT);\n"
+        "\t\t}\n"
+        "\t\tfTransferActive = true;\n"
+        "\t\tIOReturn kr = transferGated(addr, wbuf, wlen, rbuf, rlen);\n"
+        "\t\tfTransferActive = false;\n"
+        "\t\tfGate->commandWakeup(&fTransferActive);\n"
+        "\t\treturn kr;",
+        "MTKIO.cpp: serialize transfers while waiting for the hardware IRQ",
     )
     replace_exact(
         c,

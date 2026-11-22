@@ -26,7 +26,8 @@ def devices(a, ph, phandle, gic_ph, ecid, flags):
     I2C v2, and CONNSYS MT6631 register layouts as MT6781.
     """
     node, cstr, u32, spi, io, wifi_mac = a.node, a.cstr, a.u32, a.spi, a.io, a.wifi_mac
-    IRQ_EDGE_RISING, IRQ_EDGE_FALLING, IRQ_LEVEL_HIGH = a.IRQ_EDGE_RISING, a.IRQ_EDGE_FALLING, a.IRQ_LEVEL_HIGH
+    IRQ_EDGE_RISING, IRQ_LEVEL_HIGH = a.IRQ_EDGE_RISING, a.IRQ_LEVEL_HIGH
+    IRQ_LEVEL_LOW = 8  # Linux IRQ_TYPE_LEVEL_LOW, supported by MTKEINT
     HID_CSMR_POWER, HID_CSMR_VOLUME_UP, HID_CSMR_VOLUME_DOWN = a.HID_CSMR_POWER, a.HID_CSMR_VOLUME_UP, a.HID_CSMR_VOLUME_DOWN
     eint_ph = next(phandle)
 
@@ -89,13 +90,13 @@ def devices(a, ph, phandle, gic_ph, ecid, flags):
             ('ext-time-config', u32(0x1801)),
         ], [
             # STMicroelectronics FTS5CU56A touch (iokit/Kernel/arm/hid/STMTS.cpp):
-            # I2C6 @ 0x49, IRQ EINT 10 (falling edge), sec,max_coords = 4096x4096, flash-resident FW.
+            # I2C6 @ 0x49, IRQ EINT 10 (level low), sec,max_coords = 4096x4096.
             node('touch', [
                 ph(),
                 ('compatible', cstr('stm,stm_ts')),
                 ('i2c-address', u32(0x49)),
                 ('interrupt-parent', u32(eint_ph)),
-                ('interrupts', u32(10, IRQ_EDGE_FALLING)),
+                ('interrupts', u32(10, IRQ_LEVEL_LOW)),
                 ('max-x', u32(4096)),
                 ('max-y', u32(4096)),
                 ('panel-size', u32(FB['width'], FB['height'])),
