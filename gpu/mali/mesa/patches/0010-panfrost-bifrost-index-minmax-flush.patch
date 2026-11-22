@@ -1,0 +1,29 @@
+Panfrost (Bifrost/Midgard): flush any pending writer on the index buffer before
+prepare_draw() opens the current batch.
+
+On PAN_ARCH < 9, panfrost_single_draw_direct() computes index min/max bounds on
+the CPU via panfrost_get_index_buffer_bounded() -> u_vbuf_get_minmax_index() ->
+pipe_buffer_map_range(). If the index buffer has an in-flight writer batch,
+pipe_buffer_map_range() calls panfrost_flush_writer(), which can flush and tear
+down the active draw batch mid-draw (leaving batch->scoreboard/pool invalid and
+crashing in panfrost_draw_vbo). Flushing before prepare_draw() preserves full
+synchronization while keeping the active batch intact.
+
+diff --git a/src/gallium/drivers/panfrost/pan_cmdstream.c b/src/gallium/drivers/panfrost/pan_cmdstream.c
+index 0000000..1111111 100644
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
+@@ -3630,6 +3630,13 @@ panfrost_multi_draw_direct(struct pipe_context *pipe,
+                            unsigned num_draws)
+ {
+    struct panfrost_context *ctx = pan_context(pipe);
++#if PAN_ARCH < 9
++   if (info->index_size && !info->has_user_indices && info->index.resource) {
++      panfrost_flush_writer(ctx, pan_resource(info->index.resource),
++                            "Bifrost index buffer minmax pre-draw");
++   }
++#endif
++
+    struct panfrost_batch *batch = prepare_draw(pipe, info);
+    if (!batch) {
+       mesa_loge("prepare_draw failed");

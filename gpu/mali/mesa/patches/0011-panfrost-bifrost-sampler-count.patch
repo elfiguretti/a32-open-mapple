@@ -1,0 +1,75 @@
+Panfrost (Bifrost): account for decoupled samplers (s->info.samplers_used) in
+pan_shader_info::sampler_count and size/pack the sampler descriptor table
+accordingly.
+
+Metal (mapple_gpu_mali) binds constexpr samplers at VMG_CONSTEXPR_SAMPLER_BASE
+(slot 16..31) independently of texture_count. Valhall sizes the sampler
+resource table from ctx->sampler_count, but Bifrost (PAN_ARCH <= 7) bounds-
+checks TEXC sampler indices against RSD.shader.sampler_count. When
+sampler_count was copied from textures_used alone, any shader sampling with a
+constexpr sampler at slot >= texture_count triggered ADDRESS_RANGE_FAULT (0x5a)
+or IMPRECISE_FAULT (0x5b) in Mali-G52 job slot 0.
+
+Also ensure panfrost_emit_sampler_descriptors() allocates at least
+shader->info.sampler_count entries and packs a valid default SAMPLER descriptor
+for unbound slots instead of leaving invalid zeroed descriptors.
+
+diff --git a/src/panfrost/compiler/pan_compiler.c b/src/panfrost/compiler/pan_compiler.c
+index 0000000..1111111 100644
+--- a/src/panfrost/compiler/pan_compiler.c
++++ b/src/panfrost/compiler/pan_compiler.c
+@@ -302,8 +302,9 @@ pan_shader_collect_info(nir_shader *s, struct pan_shader_info *info,
+    info->writes_global = s->info.writes_memory;
+    info->ubo_count = s->info.num_ubos;
+ 
+-   info->sampler_count = info->texture_count =
+-      BITSET_LAST_BIT(s->info.textures_used);
++   info->texture_count = BITSET_LAST_BIT(s->info.textures_used);
++   info->sampler_count =
++      MAX2(info->texture_count, BITSET_LAST_BIT(s->info.samplers_used));
+ 
+    unsigned execution_mode = s->info.float_controls_execution_mode;
+    info->ftz_fp16 = nir_is_denorm_flush_to_zero(execution_mode, 16);
+diff --git a/src/gallium/drivers/panfrost/pan_cmdstream.c b/src/gallium/drivers/panfrost/pan_cmdstream.c
+index 0000000..1111111 100644
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
+@@ -2024,23 +2024,33 @@ panfrost_emit_sampler_descriptors(struct panfrost_batch *batch,
+                                   mesa_shader_stage stage)
+ {
+    struct panfrost_context *ctx = batch->ctx;
++   unsigned actual_count = ctx->sampler_count[stage];
++   unsigned needed_count =
++      ctx->prog[stage] ? ctx->prog[stage]->info.sampler_count : 0;
++   unsigned alloc_count = MAX2(actual_count, needed_count);
+ 
+    /* We always need at least 1 sampler for txf to work */
+-   if (!ctx->sampler_count[stage])
++   if (!alloc_count)
+       return panfrost_upload_wa_sampler(batch);
+ 
+    struct pan_ptr T = pan_pool_alloc_desc_array(
+-      &batch->pool.base, ctx->sampler_count[stage], SAMPLER);
++      &batch->pool.base, alloc_count, SAMPLER);
+ 
+    if (!T.cpu)
+       return 0;
+ 
+    struct mali_sampler_packed *out = (struct mali_sampler_packed *)T.cpu;
+ 
+-   for (unsigned i = 0; i < ctx->sampler_count[stage]; ++i) {
+-      struct panfrost_sampler_state *st = ctx->samplers[stage][i];
++   for (unsigned i = 0; i < alloc_count; ++i) {
++      struct panfrost_sampler_state *st =
++         i < actual_count ? ctx->samplers[stage][i] : NULL;
+ 
+-      out[i] = st ? st->hw : (struct mali_sampler_packed){0};
++      if (st) {
++         out[i] = st->hw;
++      } else {
++         pan_pack(&out[i], SAMPLER, cfg)
++            ;
++      }
+    }
+ 
+    return T.gpu;

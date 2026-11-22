@@ -1,0 +1,119 @@
+name: Build SM-A325M MappleMTLDriver (Mesa Panfrost Bifrost)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "gpu/**"
+      - ".github/workflows/build-a32-mtl.yml"
+
+concurrency:
+  group: a32-mtl-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_COMPILERCHECK: content
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,file_macro,pch_defines
+  CCACHE_MAXSIZE: 3G
+  MAPPLE_CCACHE: ccache
+
+jobs:
+  build-mtl-a32:
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout SM-A325M port repo
+        uses: actions/checkout@v4
+
+      - name: Install build deps and select Xcode with iOS SDK
+        run: |
+          brew install llvm spirv-llvm-translator spirv-tools zstd pkgconf ccache
+          BREW="$(brew --prefix)"
+          echo "BREW_PREFIX=$BREW" >> "$GITHUB_ENV"
+          echo "LLVM_PREFIX=$BREW/opt/llvm" >> "$GITHUB_ENV"
+          if [ ! -x "$BREW/bin/pkg-config" ] && [ -x "$BREW/bin/pkgconf" ]; then
+            ln -sf "$BREW/bin/pkgconf" "$BREW/bin/pkg-config"
+          fi
+          sw_vers
+          ls -d /Applications/Xcode*.app
+          XC=$(ls -d /Applications/Xcode_15*.app /Applications/Xcode_*.app /Applications/Xcode.app 2>/dev/null | head -1)
+          echo "Using Xcode: $XC"
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Restore ccache
+        id: ccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: a32-mtl-ccache-${{ hashFiles('gpu/**', '.github/workflows/build-a32-mtl.yml') }}
+          restore-keys: |
+            a32-mtl-ccache-
+
+      - name: Clone open-mapple/mapple_gpu_mali and stage A32 Bifrost patches
+        run: |
+          git clone --depth 1 https://github.com/open-mapple/mapple_gpu_mali.git gpu-build
+          cp -v gpu/mali/mesa/patches/*.patch gpu-build/mesa/patches/
+          ls -la gpu-build/mesa/patches/
+
+      - name: Build Mesa (macOS host tools + iOS arm64 Panfrost) and MappleMTLDriver.bundle
+        working-directory: gpu-build
+        run: |
+          set -o pipefail
+          ccache -z
+          JOBS=$(sysctl -n hw.ncpu)
+          echo "Building with JOBS=$JOBS"
+          JOBS=$JOBS bash ios/build.sh mesa 2>&1 | tee ../mtl-mesa.log
+          JOBS=$JOBS bash ios/build.sh driver 2>&1 | tee ../mtl-driver.log
+          ccache -s
+
+      - name: Publish compiler errors on failure
+        if: failure()
+        run: |
+          for f in mtl-mesa.log mtl-driver.log; do
+            if [ -f "$f" ]; then
+              echo "=== Tail of $f ==="
+              tail -60 "$f"
+            fi
+          done
+
+      - name: Package stripped and signed MappleMTLDriver.bundle
+        run: |
+          mkdir -p dist
+          cp -R gpu-build/ios/out/MappleMTLDriver.bundle dist/MappleMTLDriver.bundle
+          xcrun strip -S dist/MappleMTLDriver.bundle/MappleMTLDriver
+          codesign -s - -f dist/MappleMTLDriver.bundle
+          codesign -dvv dist/MappleMTLDriver.bundle
+          file dist/MappleMTLDriver.bundle/MappleMTLDriver
+          cp dist/MappleMTLDriver.bundle/MappleMTLDriver dist/MappleMTLDriver
+          tar -czf dist/MappleMTLDriver.bundle.tar.gz -C dist MappleMTLDriver.bundle
+          (cd dist && shasum -a 256 MappleMTLDriver MappleMTLDriver.bundle.tar.gz > SHA256SUMS)
+          ls -lh dist/
+
+      - name: Save ccache
+        if: always() && steps.ccache-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
+
+      - name: Publish SM-A325M MappleMTLDriver Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="hito6-mtl-latest"
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          git push origin ":refs/tags/$TAG" 2>/dev/null || true
+          gh release create "$TAG" \
+            dist/MappleMTLDriver dist/MappleMTLDriver.bundle.tar.gz dist/SHA256SUMS \
+            --title "SM-A325M MappleMTLDriver (Mali-G52 Bifrost)" \
+            --notes "Built from commit ${GITHUB_SHA} on macos-15 with Bifrost fixes: index minmax pre-draw flush (0010) and decoupled sampler_count + valid sampler descriptor padding (0011)." \
+            --prerelease
