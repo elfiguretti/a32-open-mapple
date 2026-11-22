@@ -200,6 +200,7 @@ mapple_log_append(const char *c, int size)
 #define A32_RAMOOPS_SIG      0x43474244U /* "DBGC" */
 #define A32_INFRACFG_PA      0x10001000UL
 #define A32_IFR2_CG_CLR      0x084U      /* bit 8 = CLK_IFR_ICUSB, bit 11 = CLK_IFR_I2C_AP */
+#define A32_IFR3_CG_CLR      0x08cU      /* bit 18 = CLK_IFR_AP_DMA */
 #define A32_IFR5_CG_CLR      0x0c4U      /* bit 6 = CLK_IFR_I2C6, bit 7 = CLK_IFR_AP_MSDC0 */
 #define A32_OVL0_PA          0x1400b000UL
 #define A32_MUTEX_PA         0x14001000UL
@@ -336,10 +337,11 @@ a32_console_hw_init(void)
 \ta32_mutex_va   = ml_io_map(A32_MUTEX_PA, 0x1000);
 \ta32_dsi0_va    = ml_io_map(A32_DSI0_PA, 0x1000);
 
-\t/* Ensure MT6768 infracfg_ao clock gates for USB, I2C6 (touch) and MSDC0 (eMMC) are open */
+\t/* Ensure MT6768 infracfg_ao clock gates for USB, I2C6 (touch), AP_DMA, and MSDC0 (eMMC) are open */
 \tvm_offset_t infra = ml_io_map(A32_INFRACFG_PA, 0x1000);
 \tif (infra != 0) {
 \t\ta32_io_wr32(infra, A32_IFR2_CG_CLR, (1u << 8) | (1u << 11));
+\t\ta32_io_wr32(infra, A32_IFR3_CG_CLR, (1u << 18));
 \t\ta32_io_wr32(infra, A32_IFR5_CG_CLR, (1u << 6) | (1u << 7));
 \t\t__asm__ volatile("dsb sy" ::: "memory");
 \t}
@@ -500,7 +502,7 @@ extern "C" void a32_dsi_cmd_flush_now(void);             /* bsd/dev/mtk_ufs.c (S
 
 
 def patch_pmic(xnu: Path):
-    """Accept MT6358 (hwcid 0x58xx, SM-A325M = 0x5831) alongside MT6366 (0x66xx)."""
+    """Accept MT6358 (hwcid 0x58xx, SM-A325M = 0x5831) alongside MT6366 (0x66xx), and allow VCAMA2 for touch AVDD."""
     p = xnu / "iokit" / "Kernel" / "arm" / "MT6358PMIC.cpp"
     replace_exact(
         p,
@@ -509,6 +511,156 @@ def patch_pmic(xnu: Path):
         "\tif (read(MT6358_PMIC_HWCID, &id) != kIOReturnSuccess || ((id & 0xff00) != 0x6600 && (id & 0xff00) != 0x5800)) {\n"
         "\t\tIOLog(\"PMIC: hwcid 0x%04x is not an MT6358/MT6366, not touching it\\n\", id);",
         "MT6358PMIC.cpp: accept MT6358 hwcid 0x58xx (SM-A325M = 0x5831)",
+    )
+    pw = xnu / "iokit" / "Kernel" / "arm" / "MTKPwrap.cpp"
+    replace_exact(
+        pw,
+        "\t{ 0x1d90, 0x0002, 0x01 },       /* LDO_VCN28_OP_CFG: HW0_OP_CFG */\n};",
+        "\t{ 0x1d90, 0x0002, 0x01 },       /* LDO_VCN28_OP_CFG: HW0_OP_CFG */\n"
+        "\t/* SM-A325M FTS5CU56A touch 3.0V AVDD (tsp_avdd_ldo = ldo_vcama2) */\n"
+        "\t{ 0x1e0c, 0x0f00, 0x0c },       /* VCAMA2_ANA_CON0: VOSEL[11:8] <= 0xc (3.0 V) */\n"
+        "\t{ 0x1c88, 0x0001, 0x01 },       /* LDO_VCAMA2_CON0: RG_LDO_VCAMA2_EN */\n};",
+        "MTKPwrap.cpp: whitelist MT6358 VCAMA2 (3.0V touch AVDD)",
+    )
+
+
+def patch_i2c_dma(xnu: Path):
+    """Add MT6768 APDMA support to MTKI2C for rlen > 8 (16-byte FTS5CU56A touch events)."""
+    h = xnu / "iokit" / "Kernel" / "arm" / "MTKIO.h"
+    replace_exact(
+        h,
+        "#include <IOKit/IOMemoryDescriptor.h>",
+        "#include <IOKit/IOMemoryDescriptor.h>\n#include <IOKit/IOBufferMemoryDescriptor.h>",
+        "MTKIO.h: include IOBufferMemoryDescriptor.h",
+    )
+    replace_exact(
+        h,
+        "\tuint32_t                fErrors;\n};",
+        "\tuint32_t                fErrors;\n"
+        "\tvm_offset_t             fDmaRegs;\n"
+        "\tIOBufferMemoryDescriptor *fDmaDesc;\n"
+        "\tIOMemoryMap            *fDmaMap;\n"
+        "\tvolatile uint8_t       *fDmaBuf;\n"
+        "\tuint64_t                fDmaPa;\n};",
+        "MTKIO.h: add APDMA fields to MTKI2C",
+    )
+
+    c = xnu / "iokit" / "Kernel" / "arm" / "MTKIO.cpp"
+    replace_exact(
+        c,
+        '#include "MTKIO.h"',
+        '#include "MTKIO.h"\nextern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);',
+        "MTKIO.cpp: declare ml_io_map for APDMA",
+    )
+    replace_exact(
+        c,
+        "\tinitHW();\n\tfInterrupt->enable();",
+        "\tuint32_t dmaPa = dtU32(provider, \"dma-base\", 0);\n"
+        "\tif (dmaPa != 0) {\n"
+        "\t\tfDmaRegs = ml_io_map((vm_offset_t)dmaPa, 0x80);\n"
+        "\t\tfDmaDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,\n"
+        "\t\t    kIODirectionInOut | kIOMemoryPhysicallyContiguous, 4096, 0xfffffffffffff000ull);\n"
+        "\t\tif (fDmaRegs != 0 && fDmaDesc != NULL) {\n"
+        "\t\t\tfDmaPa = fDmaDesc->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);\n"
+        "\t\t\tbzero(fDmaDesc->getBytesNoCopy(), 4096);\n"
+        "\t\t\tfDmaDesc->performOperation(kIOMemoryIncoherentIOFlush, 0, 4096);\n"
+        "\t\t\tfDmaMap = fDmaDesc->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache, 0, 0);\n"
+        "\t\t\tif (fDmaMap != NULL) {\n"
+        "\t\t\t\tfDmaBuf = (volatile uint8_t *)fDmaMap->getVirtualAddress();\n"
+        "\t\t\t\tIOLog(\"I2C: bus %u APDMA @ 0x%x buf pa 0x%llx\\n\", fBusId, dmaPa, fDmaPa);\n"
+        "\t\t\t}\n"
+        "\t\t}\n"
+        "\t}\n"
+        "\tinitHW();\n\tfInterrupt->enable();",
+        "MTKIO.cpp: map APDMA and coherent buffer in MTKI2C::start",
+    )
+    replace_exact(
+        c,
+        "\tOSSafeReleaseNULL(fMap);\n\tOSSafeReleaseNULL(fWorkLoop);",
+        "\tOSSafeReleaseNULL(fDmaMap);\n\tOSSafeReleaseNULL(fDmaDesc);\n\tOSSafeReleaseNULL(fMap);\n\tOSSafeReleaseNULL(fWorkLoop);",
+        "MTKIO.cpp: release APDMA resources in MTKI2C::free",
+    )
+    replace_exact(
+        c,
+        "\tif (addr > 0x7f || wlen == 0 || wlen > kFIFOSize || rlen > kFIFOSize || (rlen && rbuf == NULL)) {\n"
+        "\t\treturn kIOReturnBadArgument;\n"
+        "\t}",
+        "\tuint32_t maxR = (fDmaRegs != 0 && fDmaBuf != NULL) ? 64u : (uint32_t)kFIFOSize;\n"
+        "\tif (addr > 0x7f || wlen == 0 || wlen > kFIFOSize || rlen > maxR || (rlen && rbuf == NULL)) {\n"
+        "\t\treturn kIOReturnBadArgument;\n"
+        "\t}",
+        "MTKIO.cpp: allow up to 64-byte reads when APDMA is configured",
+    )
+    replace_exact(
+        c,
+        "\tbool wrrd = rlen != 0;\n"
+        "\n"
+        "\twr16(I2C_HW_TIMEOUT, fHWTimeout);\n"
+        "\twr16(I2C_CLOCK_DIV, (uint16_t)(((fClockDiv - 1) << 8) | (fClockDiv - 1)));\n"
+        "\tuint16_t control = CONTROL_ACKERR_DET_EN | CONTROL_CLK_EXT_EN;\n"
+        "\tif (wrrd) {\n"
+        "\t\tcontrol |= CONTROL_DIR_CHANGE | CONTROL_RS;\n"
+        "\t}\n"
+        "\twr16(I2C_CONTROL, control);",
+        "\tbool wrrd = rlen != 0;\n"
+        "\tbool useDma = wrrd && rlen > kFIFOSize && fDmaRegs != 0 && fDmaBuf != NULL;\n"
+        "\n"
+        "\twr16(I2C_HW_TIMEOUT, fHWTimeout);\n"
+        "\twr16(I2C_CLOCK_DIV, (uint16_t)(((fClockDiv - 1) << 8) | (fClockDiv - 1)));\n"
+        "\tuint16_t control = CONTROL_ACKERR_DET_EN | CONTROL_CLK_EXT_EN;\n"
+        "\tif (wrrd) {\n"
+        "\t\tcontrol |= CONTROL_DIR_CHANGE | CONTROL_RS;\n"
+        "\t}\n"
+        "\tif (useDma) {\n"
+        "\t\tcontrol |= 0x0004; /* I2C_CONTROL_DMA_EN */\n"
+        "\t}\n"
+        "\twr16(I2C_CONTROL, control);",
+        "MTKIO.cpp: set I2C_CONTROL_DMA_EN for rlen > 8",
+    )
+    replace_exact(
+        c,
+        "\tfor (uint32_t i = 0; i < wlen; i++) {\n"
+        "\t\t*(volatile uint8_t *)(fRegs + I2C_DATA_PORT) = wbuf[i];\n"
+        "\t}",
+        "\tif (useDma) {\n"
+        "\t\tfor (uint32_t i = 0; i < wlen; i++) {\n"
+        "\t\t\tfDmaBuf[i] = wbuf[i];\n"
+        "\t\t}\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x0c) = 1; /* DMA warm RST */\n"
+        "\t\tIODelay(5);\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x00) = 0; /* INT_FLAG */\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x18) = 0; /* CON = WRRD */\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x1c) = (uint32_t)fDmaPa;\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x20) = (uint32_t)fDmaPa;\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x54) = (uint32_t)(fDmaPa >> 32);\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x58) = (uint32_t)(fDmaPa >> 32);\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x24) = wlen;\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x28) = rlen;\n"
+        "\t\tOSMemoryBarrier();\n"
+        "\t\t*(volatile uint32_t *)(fDmaRegs + 0x08) = 1; /* DMA EN */\n"
+        "\t} else {\n"
+        "\t\tfor (uint32_t i = 0; i < wlen; i++) {\n"
+        "\t\t\t*(volatile uint8_t *)(fRegs + I2C_DATA_PORT) = wbuf[i];\n"
+        "\t\t}\n"
+        "\t}",
+        "MTKIO.cpp: program APDMA for WRRD transactions with rlen > 8",
+    )
+    replace_exact(
+        c,
+        "\tfor (uint32_t i = 0; i < rlen; i++) {\n"
+        "\t\trbuf[i] = *(volatile uint8_t *)(fRegs + I2C_DATA_PORT);\n"
+        "\t}",
+        "\tif (useDma) {\n"
+        "\t\tOSMemoryBarrier();\n"
+        "\t\tfor (uint32_t i = 0; i < rlen; i++) {\n"
+        "\t\t\trbuf[i] = fDmaBuf[i];\n"
+        "\t\t}\n"
+        "\t} else {\n"
+        "\t\tfor (uint32_t i = 0; i < rlen; i++) {\n"
+        "\t\t\trbuf[i] = *(volatile uint8_t *)(fRegs + I2C_DATA_PORT);\n"
+        "\t\t}\n"
+        "\t}",
+        "MTKIO.cpp: copy APDMA RX buffer back to caller",
     )
 
 
@@ -596,6 +748,7 @@ def main():
     patch_pe_serial(xnu)
     patch_platform_expert(xnu)
     patch_pmic(xnu)
+    patch_i2c_dma(xnu)
     patch_framebuffer(xnu)
     patch_usb_link(xnu)
     print("Overlay applied cleanly!")

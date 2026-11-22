@@ -3,23 +3,23 @@
  * touchscreen driver, subclass of MappleHIDTouch.
  *
  * Matches /arm-io/i2c6/touch ("stm,stm_ts"), published as a MappleDTNub child
- * of MTKI2C (bus 6 @ 0x1100d000).
+ * of MTKI2C (bus 6 @ 0x1100d000, APDMA @ 0x11000600).
  *
- * Protocol verified directly against Samsung SM-A325M kernel source
- * (drivers/input/sec_input/stm/stm_reg.h, stm_dev.h, stm_core.c) and live.dts:
- *   - I2C 7-bit address: 0x49
- *   - IRQ: EINT/GPIO 10, falling edge
- *   - Flash-resident firmware (fts5cu56a_a32.bin, sec,regulator_boot_on):
- *     no firmware download required at boot.
+ * Hardware & protocol verified live on SM-A325M silicon (2026-11-22):
+ *   - Power rails:
+ *       * tsp_avdd_ldo (3.0V): MT6358 VCAMA2 (ANA_CON0 0x1e0c = 0x0c00, CON0 0x1c88 bit 0 = 1)
+ *       * tsp_io_ldo   (1.8V): GPIO 4 output HIGH (fixed_regulator@0)
+ *   - I2C 7-bit address: 0x49 on bus 6 (400 kHz)
+ *   - IRQ: EINT/GPIO 10, falling edge (active-low while FIFO non-empty)
+ *   - Flash-resident firmware (fts5cu56a_a32.bin, verified live: id=535448 fw=02.54.00.16)
  *   - Commands:
- *       0x22 READ_DEVICE_ID   (3 bytes)
- *       0x24 READ_FW_VERSION  (4 bytes)
+ *       0x22 READ_DEVICE_ID   (3 bytes -> 53 54 48)
+ *       0x24 READ_FW_VERSION  (4 bytes -> 02 54 00 16)
  *       0x62 CLEAR_ALL_EVENT  (0 bytes)
  *       0x10 SENSE_ON         (0 bytes)
- *       0x60 READ_ONE_EVENT   (16-byte hardware packet; all coordinate fields
- *                              and left_event sit in bytes 0..7, which fits
- *                              MTKI2C::kFIFOSize = 8 directly!).
- *   - Coordinate event layout (stm_event_coordinate, 8 bytes):
+ *       0x60 READ_ONE_EVENT   (16 bytes via I2C6 APDMA — MUST read all 16 bytes
+ *                              in a single transaction to pop the IC FIFO!)
+ *   - Coordinate event layout (stm_ts_event_coordinate, 16 bytes):
  *       b[0]: eid[1:0] (0 = coordinate), tid[5:2] (0..9), tchsta[7:6] (1=ENTER, 2=MOVE, 3=LEAVE)
  *       b[1]: x[11:4]
  *       b[2]: y[11:4]
@@ -36,15 +36,18 @@
 #include "MappleHIDTouch.h"
 #include "../MTKIO.h"
 
+extern "C" int mtk_pwrap_write_regulator(uint32_t addr, uint32_t mask, uint32_t value);
+extern "C" int mapple_gpio_set(uint32_t pin, int high);
+
 #define STM_CMD_SENSE_ON        0x10
 #define STM_CMD_READ_ID         0x22
 #define STM_CMD_READ_FW_VER     0x24
 #define STM_CMD_READ_ONE_EVENT  0x60
 #define STM_CMD_CLEAR_ALL_EVENT 0x62
 
+#define STM_EVENT_SIZE          16
 #define STM_EID_COORDINATE      0x00
 #define STM_EID_STATUS          0x01
-#define STM_EID_NONE            0x00
 
 #define STM_TCHSTA_ENTER        1
 #define STM_TCHSTA_MOVE         2
@@ -52,6 +55,11 @@
 
 #define STM_MAX_FINGERS         MAPPLE_TOUCH_FINGERS
 #define STM_MAX_EVENTS_PER_IRQ  32
+
+/* SM-A325M touch power rails (verified from live.dts + mt6358-regulator.c) */
+#define A32_TSP_IO_GPIO         4
+#define MT6358_VCAMA2_ANA_CON0  0x1e0c
+#define MT6358_LDO_VCAMA2_CON0  0x1c88
 
 class STMTS : public MappleHIDTouch {
 	OSDeclareDefaultStructors(STMTS);
@@ -63,6 +71,8 @@ protected:
 	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString("FTS5CU56A"); }
 private:
 	static void interruptOccurred(OSObject *owner, IOInterruptEventSource *src, int count);
+	void powerOn(void);
+	void drainEvents(void);
 	void handleEvent(void);
 	void releaseAll(void);
 	IOReturn sendCmd(uint8_t cmd);
@@ -76,6 +86,7 @@ private:
 	uint32_t fPanelW, fPanelH;
 	uint32_t fActiveMask;
 	uint32_t fErrors;
+	uint32_t fLogCount;
 };
 
 OSDefineMetaClassAndStructors(STMTS, MappleHIDTouch);
@@ -103,6 +114,52 @@ IOReturn
 STMTS::readCmd(uint8_t cmd, uint8_t *buf, uint32_t len)
 {
 	return fBus->transfer(fAddr, &cmd, 1, buf, len);
+}
+
+void
+STMTS::powerOn(void)
+{
+	/* 1) Enable 3.0V AVDD on MT6358 VCAMA2 (wait up to 5 s if MTKPwrap is still attaching) */
+	int prc = -1;
+	for (int i = 0; i < 100; i++) {
+		prc = mtk_pwrap_write_regulator(MT6358_VCAMA2_ANA_CON0, 0x0f00, 0x0c00);
+		if (prc != -1) {
+			break;
+		}
+		IOSleep(50);
+	}
+	if (prc == 0) {
+		(void)mtk_pwrap_write_regulator(MT6358_LDO_VCAMA2_CON0, 0x0001, 0x0001);
+	} else {
+		IOLog("TOUCH: FTS5CU56A VCAMA2 power-on failed (%d)\n", prc);
+	}
+
+	/* 2) Enable 1.8V I/O LDO on GPIO 4 (wait for MTKGPIO if needed) */
+	(void)MTKGPIO::wait();
+	int grc = mapple_gpio_set(A32_TSP_IO_GPIO, 1);
+	if (grc != 0) {
+		IOLog("TOUCH: FTS5CU56A GPIO %u power-on failed (%d)\n", A32_TSP_IO_GPIO, grc);
+	}
+
+	/* Allow FTS5CU56A internal MCU to boot its flash firmware */
+	IOSleep(100);
+}
+
+void
+STMTS::drainEvents(void)
+{
+	for (uint32_t i = 0; i < STM_MAX_EVENTS_PER_IRQ; i++) {
+		uint8_t ev[STM_EVENT_SIZE] = { 0 };
+		if (readCmd(STM_CMD_READ_ONE_EVENT, ev, sizeof(ev)) != kIOReturnSuccess) {
+			break;
+		}
+		if (ev[0] == 0 && ev[1] == 0 && ev[2] == 0 && ev[3] == 0) {
+			break;
+		}
+		if ((ev[7] & 0x1fu) == 0) {
+			break;
+		}
+	}
 }
 
 bool
@@ -134,15 +191,17 @@ STMTS::start(IOService *provider)
 		return false;
 	}
 
+	powerOn();
+
 	uint8_t id[3] = { 0 };
 	uint8_t fw[4] = { 0 };
 	IOReturn kr = kIOReturnIOError;
-	for (int attempt = 0; attempt < 3; attempt++) {
+	for (int attempt = 0; attempt < 5; attempt++) {
 		kr = readCmd(STM_CMD_READ_ID, id, sizeof(id));
-		if (kr == kIOReturnSuccess) {
+		if (kr == kIOReturnSuccess && (id[0] != 0 || id[1] != 0 || id[2] != 0)) {
 			break;
 		}
-		IOSleep(20);
+		IOSleep(30);
 	}
 	if (kr != kIOReturnSuccess) {
 		IOLog("TOUCH: FTS5CU56A at 0x%02x did not answer (kr=0x%x)\n", fAddr, kr);
@@ -152,9 +211,13 @@ STMTS::start(IOService *provider)
 	IOLog("TOUCH: FTS5CU56A at 0x%02x id=%02x%02x%02x fw=%02x.%02x.%02x.%02x\n",
 	    fAddr, id[0], id[1], id[2], fw[0], fw[1], fw[2], fw[3]);
 
+	/* Clear boot/status events, enable capacitive sensing, and drain ack so EINT10 rises HIGH */
 	(void)sendCmd(STM_CMD_CLEAR_ALL_EVENT);
-	IOSleep(5);
+	IOSleep(10);
+	drainEvents();
 	(void)sendCmd(STM_CMD_SENSE_ON);
+	IOSleep(15);
+	drainEvents();
 
 	if (!MappleHIDTouch::start(provider)) {
 		return false;
@@ -165,6 +228,8 @@ STMTS::start(IOService *provider)
 		return false;
 	}
 	fInterrupt->enable();
+	/* One final drain after enabling IRQ in case an event arrived during startup */
+	drainEvents();
 	IOLog("TOUCH: FTS5CU56A on, coords %ux%u -> panel %ux%u\n", fMaxX, fMaxY, fPanelW, fPanelH);
 	return true;
 }
@@ -207,7 +272,7 @@ void
 STMTS::handleEvent(void)
 {
 	for (uint32_t iter = 0; iter < STM_MAX_EVENTS_PER_IRQ; iter++) {
-		uint8_t ev[8] = { 0 };
+		uint8_t ev[STM_EVENT_SIZE] = { 0 };
 		if (readCmd(STM_CMD_READ_ONE_EVENT, ev, sizeof(ev)) != kIOReturnSuccess) {
 			if (++fErrors <= 8) {
 				IOLog("TOUCH: FTS5CU56A event read error #%u\n", fErrors);
@@ -237,9 +302,17 @@ STMTS::handleEvent(void)
 				int py = (int)((raw_y * fPanelH) / fMaxY);
 
 				if (tchsta == STM_TCHSTA_ENTER || tchsta == STM_TCHSTA_MOVE) {
+					if (tchsta == STM_TCHSTA_ENTER && fLogCount < 8) {
+						fLogCount++;
+						IOLog("TOUCH: FTS5CU56A down tid=%u (%d,%d)\n", tid, px, py);
+					}
 					fActiveMask |= (1u << tid);
 					touch((int)tid, true, px, py);
 				} else if (tchsta == STM_TCHSTA_LEAVE) {
+					if (fLogCount < 8) {
+						fLogCount++;
+						IOLog("TOUCH: FTS5CU56A up   tid=%u (%d,%d)\n", tid, px, py);
+					}
 					fActiveMask &= ~(1u << tid);
 					touch((int)tid, false, px, py);
 				}

@@ -66,19 +66,20 @@ def devices(a, ph, phandle, gic_ph, ecid, flags):
             ('compatible', cstr('mediatek,mt6366-keys')),
             ('keymap', u32(0, HID_CSMR_POWER, 1, HID_CSMR_VOLUME_DOWN)),
         ])])]),
-        # GPIO controller @ 0x10005000.
+        # GPIO controller @ 0x10005000 (pin 4 = tsp_io_ldo fixed_regulator@0 for FTS5CU56A touch).
         node('gpio', [
             ph(),
             ('compatible', cstr('mediatek,mt6781-gpio')),
             ('reg', io(0x10005000, 0x1000)),
+            ('output-pins', u32(4)),
         ]),
         # I2C6 @ 0x1100d000 (SPI 0x94, i2c_common ver=2, ext_time_config=0x1801, clock-div=5,
-        # source-clock=univpll3_d4=124.8 MHz). Clock gate is in infracfg_ao (ungated by a32_console_hw_init),
-        # so imp-cg-bit is omitted. Hosts STMicroelectronics FTS5CU56A touchscreen @ 0x49 as a MappleDTNub child.
+        # source-clock=univpll3_d4=124.8 MHz, APDMA @ 0x11000600 for 16-byte FTS5CU56A events).
         node('i2c6', [
             ph(),
             ('compatible', cstr('mediatek,mt6781-i2c')),
             ('reg', io(0x1100d000, 0x1000)),
+            ('dma-base', u32(0x11000600)),
             ('interrupt-parent', u32(gic_ph)),
             ('interrupts', spi(0x94, IRQ_LEVEL_HIGH)),
             ('bus-id', u32(6)),
