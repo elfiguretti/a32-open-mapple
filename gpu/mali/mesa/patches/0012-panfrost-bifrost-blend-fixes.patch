@@ -1,119 +1,16 @@
-Panfrost (Bifrost v7): fix overdraw_alpha inversion, opaque blend mode, and
-fbfetch destination-load / blend handling on Mali-G52.
+Panfrost (Bifrost v7): fix overdraw_alpha inversion and RGB1 blend workaround.
 
 1. Fix upstream Mesa 26.2.6 bug in panfrost_overdraw_alpha() (pan_cmdstream.h):
    !info.enabled was inverted and pan_cmdstream.c passed 0/1 swapped for
    overdraw_alpha0/overdraw_alpha1, causing opaque draws to advertise
    overdraw_alpha0 = true.
-2. On Bifrost (PAN_ARCH <= 7), use MALI_BLEND_MODE_FIXED_FUNCTION instead of
-   MALI_BLEND_MODE_OPAQUE (controlled by PAN_BIFROST_NO_OPAQUE, default on) and
-   apply the RGB1->RGBA workaround uniformly.
-3. On Bifrost (PAN_ARCH <= 7), set load_destination when the fragment shader
-   reads that render target via framebuffer fetch (outputs_read, controlled by
-   PAN_BIFROST_FBFETCH_LOADDEST, default on), and provide runtime diagnostic
-   toggles PAN_BIFROST_NO_FPK=1 and PAN_BIFROST_FBFETCH_SRCOVER=1.
-
+2. On PAN_ARCH >= 7, apply the RGB1->RGBA workaround uniformly while keeping
+   fast hardware MALI_BLEND_MODE_OPAQUE for opaque draws.
 diff --git a/src/gallium/drivers/panfrost/pan_cmdstream.c b/src/gallium/drivers/panfrost/pan_cmdstream.c
-index bcb3abe..a288723 100644
+index bcb3abe..9626acf 100644
 --- a/src/gallium/drivers/panfrost/pan_cmdstream.c
 +++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
-@@ -290,6 +290,26 @@ panfrost_emit_blend(struct panfrost_batch *batch, void *rts,
-    struct panfrost_context *ctx = batch->ctx;
-    const struct panfrost_blend_state *so = ctx->blend;
-    bool dithered = so->base.dither;
-+#if PAN_ARCH >= 6 && PAN_ARCH <= 7
-+   struct panfrost_compiled_shader *fs = ctx->prog[MESA_SHADER_FRAGMENT];
-+   static int bifrost_no_opaque = -1;
-+   static int bifrost_fbfetch_loaddest = -1;
-+   static int bifrost_fbfetch_srcover = -1;
-+   if (bifrost_no_opaque < 0) {
-+      const char *e = getenv("PAN_BIFROST_NO_OPAQUE");
-+      bifrost_no_opaque = e ? (atoi(e) != 0) : 1;
-+   }
-+   if (bifrost_fbfetch_loaddest < 0) {
-+      const char *e = getenv("PAN_BIFROST_FBFETCH_LOADDEST");
-+      bifrost_fbfetch_loaddest = e ? (atoi(e) != 0) : 1;
-+   }
-+   if (bifrost_fbfetch_srcover < 0) {
-+      const char *e = getenv("PAN_BIFROST_FBFETCH_SRCOVER");
-+      bifrost_fbfetch_srcover = e ? (atoi(e) != 0) : 0;
-+   }
-+   uint32_t fs_outputs_read =
-+      fs ? (fs->info.fs.outputs_read >> FRAG_RESULT_DATA0) : 0;
-+#endif
- 
-    /* Always have at least one render target for depth-only passes */
-    for (unsigned i = 0; i < MAX2(rt_count, 1); ++i) {
-@@ -326,10 +346,24 @@ panfrost_emit_blend(struct panfrost_batch *batch, void *rts,
-          info.opaque = true;
-       }
- 
-+#if PAN_ARCH >= 6 && PAN_ARCH <= 7
-+      bool fs_reads_rt = (fs_outputs_read & BITFIELD_BIT(i)) != 0;
-+      bool force_srcover = bifrost_fbfetch_srcover && !blend_shaders[i] &&
-+                           !rtso->blend_enable && fs_reads_rt && i == 0;
-+      bool load_dest = info.load_dest ||
-+                       (bifrost_fbfetch_loaddest && fs_reads_rt) ||
-+                       force_srcover;
-+      bool use_opaque = info.opaque && !bifrost_no_opaque && !force_srcover;
-+#else
-+      bool load_dest = info.load_dest;
-+      UNUSED bool use_opaque = info.opaque;
-+      bool force_srcover = false;
-+#endif
-+
-       /* Word 0: Flags and constant */
-       pan_pack(packed, BLEND, cfg) {
-          cfg.srgb = util_format_is_srgb(format);
--         cfg.load_destination = info.load_dest;
-+         cfg.load_destination = load_dest;
-          cfg.round_to_fb_precision = !dithered;
-          cfg.alpha_to_one = ctx->blend->base.alpha_to_one;
- #if PAN_ARCH >= 6
-@@ -348,15 +382,25 @@ panfrost_emit_blend(struct panfrost_batch *batch, void *rts,
-       if (!blend_shaders[i]) {
-          /* Word 1: Blend Equation */
-          STATIC_ASSERT(pan_size(BLEND_EQUATION) == 4);
--         packed->opaque[PAN_ARCH >= 6 ? 1 : 2] =
--            util_format_is_float(format) ? so->float_equation[i]
--                                         : so->equation[i];
-+         if (force_srcover) {
-+            struct pan_blend_equation eq = so->pan.rts[i].equation;
-+            eq.blend_enable = true;
-+            eq.rgb_func = PIPE_BLEND_ADD;
-+            eq.alpha_func = PIPE_BLEND_ADD;
-+            eq.rgb_src_factor = PIPE_BLENDFACTOR_ONE;
-+            eq.alpha_src_factor = PIPE_BLENDFACTOR_ONE;
-+            eq.rgb_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA;
-+            eq.alpha_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA;
-+            eq.is_float = util_format_is_float(format);
-+            packed->opaque[PAN_ARCH >= 6 ? 1 : 2] = pan_pack_blend(eq);
-+         } else {
-+            packed->opaque[PAN_ARCH >= 6 ? 1 : 2] =
-+               util_format_is_float(format) ? so->float_equation[i]
-+                                            : so->equation[i];
-+         }
-       }
- 
- #if PAN_ARCH >= 6
--#if PAN_ARCH <= 7
--      struct panfrost_compiled_shader *fs = ctx->prog[MESA_SHADER_FRAGMENT];
--#endif
-       struct mali_internal_blend_packed *internal_blend_packed =
-          (struct mali_internal_blend_packed *)&packed->opaque[2];
- 
-@@ -384,8 +428,8 @@ panfrost_emit_blend(struct panfrost_batch *batch, void *rts,
-          }
-       } else {
-          pan_pack(internal_blend_packed, INTERNAL_BLEND, cfg) {
--            cfg.mode = info.opaque ? MALI_BLEND_MODE_OPAQUE
--                                   : MALI_BLEND_MODE_FIXED_FUNCTION;
-+            cfg.mode = use_opaque ? MALI_BLEND_MODE_OPAQUE
-+                                  : MALI_BLEND_MODE_FIXED_FUNCTION;
- 
-             /* If we want the conversion to work properly,
-              * num_comps must be set to 4
-@@ -396,8 +440,7 @@ panfrost_emit_blend(struct panfrost_batch *batch, void *rts,
+@@ -396,8 +396,7 @@ panfrost_emit_blend(struct panfrost_batch *batch, void *rts,
              cfg.fixed_function.rt = i;
  
  #if PAN_ARCH >= 7
@@ -123,50 +20,14 @@ index bcb3abe..a288723 100644
                     MALI_RGB_COMPONENT_ORDER_RGB1) {
                 /* fixed function does not like RGB1 as the component order */
                 /* force this field to be the default 0 (RGBA) */
-@@ -407,7 +450,7 @@ panfrost_emit_blend(struct panfrost_batch *batch, void *rts,
-             }
- #endif
- #if PAN_ARCH <= 7
--            if (!info.opaque) {
-+            if (!use_opaque) {
-                cfg.fixed_function.alpha_zero_nop = info.alpha_zero_nop;
-                cfg.fixed_function.alpha_one_store = info.alpha_one_store;
-             }
-@@ -514,8 +557,15 @@ panfrost_prepare_fs_state(struct panfrost_context *ctx, uint64_t *blend_shaders,
-          cfg.properties.pixel_kill_operation = earlyzs.kill;
-          cfg.properties.zs_update_operation = earlyzs.update;
- 
--         cfg.properties.allow_forward_pixel_to_kill =
--            pan_allow_forward_pixel_to_kill(ctx, fs);
-+         {
-+            static int bifrost_no_fpk = -1;
-+            if (bifrost_no_fpk < 0) {
-+               const char *e = getenv("PAN_BIFROST_NO_FPK");
-+               bifrost_no_fpk = e ? (atoi(e) != 0) : 0;
-+            }
-+            cfg.properties.allow_forward_pixel_to_kill =
-+               bifrost_no_fpk ? false : pan_allow_forward_pixel_to_kill(ctx, fs);
-+         }
- #else
-          cfg.properties.force_early_z =
-             fs->info.fs.can_early_z && !alpha_to_coverage &&
-@@ -595,8 +645,17 @@ panfrost_prepare_fs_state(struct panfrost_context *ctx, uint64_t *blend_shaders,
+@@ -595,8 +594,8 @@ panfrost_prepare_fs_state(struct panfrost_context *ctx, uint64_t *blend_shaders,
        cfg.properties.point_sprite_coord_origin_max_y =
           (rast->sprite_coord_mode == PIPE_SPRITE_COORD_LOWER_LEFT);
  
 -      cfg.multisample_misc.overdraw_alpha0 = panfrost_overdraw_alpha(ctx, 0);
 -      cfg.multisample_misc.overdraw_alpha1 = panfrost_overdraw_alpha(ctx, 1);
-+      {
-+         static int bifrost_no_fpk2 = -1;
-+         if (bifrost_no_fpk2 < 0) {
-+            const char *e = getenv("PAN_BIFROST_NO_FPK");
-+            bifrost_no_fpk2 = e ? (atoi(e) != 0) : 0;
-+         }
-+         cfg.multisample_misc.overdraw_alpha0 =
-+            bifrost_no_fpk2 ? false : panfrost_overdraw_alpha(ctx, true);
-+         cfg.multisample_misc.overdraw_alpha1 =
-+            bifrost_no_fpk2 ? false : panfrost_overdraw_alpha(ctx, false);
-+      }
++      cfg.multisample_misc.overdraw_alpha0 = panfrost_overdraw_alpha(ctx, true);
++      cfg.multisample_misc.overdraw_alpha1 = panfrost_overdraw_alpha(ctx, false);
  #endif
  
        cfg.stencil_mask_misc.alpha_to_coverage = alpha_to_coverage;

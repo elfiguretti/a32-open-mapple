@@ -304,6 +304,19 @@ a32_dsi_is_busy(void)
 \treturn 0;
 }
 
+int a32_dsi_is_busy_ext(void);
+int
+a32_dsi_is_busy_ext(void)
+{
+\tif (!a32_hw_ready || a32_dsi0_va == 0 || a32_mutex_va == 0) {
+\t\treturn 0;
+\t}
+\tif (os_atomic_load(&a32_dsi_dcs_busy, acquire) != 0) {
+\t\treturn 1;
+\t}
+\treturn a32_dsi_is_busy();
+}
+
 void a32_dsi_cmd_flush_mode(int force);
 void
 a32_dsi_cmd_flush_mode(int force)
@@ -556,6 +569,7 @@ def patch_framebuffer(xnu: Path):
     # Forward-declare a32_dsi_cmd_flush_now / a32_dsi_set_brightness near the top of the file (before AppleCLCD!)
     old_decl = """extern "C" void mtk_ufs_safe_clear(void);                /* bsd/dev/mtk_ufs.c */"""
     new_decl = """extern "C" void mtk_ufs_safe_clear(void);                /* bsd/dev/mtk_ufs.c */
+extern "C" int a32_dsi_is_busy_ext(void);                /* bsd/dev/mtk_ufs.c (SM-A325M DSI CMD) */
 extern "C" void a32_dsi_cmd_flush_now(void);             /* bsd/dev/mtk_ufs.c (SM-A325M DSI CMD) */
 extern "C" int a32_dsi_set_brightness(uint32_t level);   /* bsd/dev/mtk_ufs.c (SM-A325M S6E3FC3 DCS) */
 extern "C" void a32_touch_display_power(int on);         /* hid/STMTS.cpp */"""
@@ -587,7 +601,10 @@ extern "C" void a32_touch_display_power(int on);         /* hid/STMTS.cpp */"""
     replace_exact(p, old_rdma, new_rdma, "MappleFramebuffer.cpp: MT6768 RDMA0/RSZ0 bases")
 
     old_pres = """\treturn present(recs + (size_t)pick * MAPPLE_FB_SWAP_REC_SIZE, force, jobs) ? pick : -1;"""
-    new_pres = """\tbool ok = present(recs + (size_t)pick * MAPPLE_FB_SWAP_REC_SIZE, force, jobs);
+    new_pres = """\tfor (int a32_w = 0; a32_w < 30 && a32_dsi_is_busy_ext(); a32_w++) {
+\t\tIOSleep(1);
+\t}
+\tbool ok = present(recs + (size_t)pick * MAPPLE_FB_SWAP_REC_SIZE, force, jobs);
 \tif (ok) {
 \t\ta32_dsi_cmd_flush_now();
 \t}

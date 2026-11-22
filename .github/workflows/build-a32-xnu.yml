@@ -24,7 +24,7 @@ on:
       - ".github/workflows/build-a32-xnu.yml"
 
 concurrency:
-  group: a32-xnu-${{ github.ref }}
+  group: a32-xnu-${{ github.ref }}-${{ inputs.kernel_config || 'DEVELOPMENT' }}
   cancel-in-progress: true
 
 env:
@@ -169,7 +169,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="hito3-latest"
+          if [ "$KERNEL_CONFIG" = "RELEASE" ]; then
+            TAG="hito3-release-latest"
+          else
+            TAG="hito3-latest"
+          fi
           gh release delete "$TAG" --yes 2>/dev/null || true
           git push origin ":refs/tags/$TAG" 2>/dev/null || true
           gh release create "$TAG" \
