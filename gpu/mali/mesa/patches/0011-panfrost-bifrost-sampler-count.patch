@@ -11,8 +11,9 @@ constexpr sampler at slot >= texture_count triggered ADDRESS_RANGE_FAULT (0x5a)
 or IMPRECISE_FAULT (0x5b) in Mali-G52 job slot 0.
 
 Also ensure panfrost_emit_sampler_descriptors() allocates at least
-shader->info.sampler_count entries and packs a valid default SAMPLER descriptor
-for unbound slots instead of leaving invalid zeroed descriptors.
+shader->info.sampler_count entries, packs a valid default SAMPLER descriptor
+for unbound slots instead of leaving invalid zeroed descriptors, and re-emits
+sampler descriptors when the bound shader changes.
 
 diff --git a/src/panfrost/compiler/pan_compiler.c b/src/panfrost/compiler/pan_compiler.c
 index 0000000..1111111 100644
@@ -73,3 +74,12 @@ index 0000000..1111111 100644
     }
  
     return T.gpu;
+@@ -3172,7 +3182,7 @@ panfrost_update_shader_state(struct panfrost_batch *batch,
+       batch->textures[st] = panfrost_emit_texture_descriptors(batch, st);
+    }
+ 
+-   if (dirty & PAN_DIRTY_STAGE_SAMPLER) {
++   if (dirty & (PAN_DIRTY_STAGE_SAMPLER | PAN_DIRTY_STAGE_SHADER)) {
+       batch->samplers[st] = panfrost_emit_sampler_descriptors(batch, st);
+    }
+ 
