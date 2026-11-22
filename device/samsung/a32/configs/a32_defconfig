@@ -1,0 +1,5 @@
+# Open Mapple defconfig for Samsung Galaxy A32 4G (a32 / SM-A325M, MediaTek MT6769T / mt6768):
+# common MediaTek XNU config + mt6768 SoC config + a32 device fragment.
+#include common_defconfig
+#include mt6768.config
+#include a32.config

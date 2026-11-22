@@ -1,0 +1,168 @@
+name: Build SM-A325M XNU (Open Mapple + MT6768)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_config:
+        description: XNU KERNEL_CONFIG
+        type: choice
+        options:
+          - DEVELOPMENT
+          - RELEASE
+        default: DEVELOPMENT
+      extra_cmdline:
+        description: Extra XNU boot-args appended to safe Hito 3 defaults
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - "kernel/**"
+      - "device/**"
+      - "build/**"
+      - "mapple/**"
+      - "tools/**"
+      - ".github/workflows/build-a32-xnu.yml"
+
+concurrency:
+  group: a32-xnu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACOS_VERSION: "13.5"
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: MT6781
+  ARCH_CONFIG: ARM64
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_COMPILERCHECK: content
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,file_macro,pch_defines
+  CCACHE_MAXSIZE: 3G
+  CCACHE_WRAP: ${{ github.workspace }}/ccache-bin
+
+jobs:
+  build-xnu-a32:
+    # Public repositories get FREE unlimited macOS runner minutes on GitHub Actions!
+    runs-on: macos-15
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout SM-A325M port repo
+        uses: actions/checkout@v4
+
+      - name: Install build deps and select oldest Xcode 15.x
+        run: |
+          brew install jq bash cmake ninja ccache lld
+          # Provide stub gum & xcodes (Xcode is preinstalled on macos-15)
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/gum /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/gum /usr/local/bin/xcodes
+          sw_vers
+          ls -d /Applications/Xcode*.app
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          echo "Using Xcode: $XC"
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --find iig
+          mkdir -p "$CCACHE_WRAP"
+          for t in clang clang++; do
+            printf '#!/bin/sh\nexec ccache %s "$@"\n' "$(xcrun -find $t)" > "$CCACHE_WRAP/$t"
+            chmod +x "$CCACHE_WRAP/$t"
+          done
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: a32-ccache-${{ env.KERNEL_CONFIG }}-${{ hashFiles('kernel/**', '.github/workflows/build-a32-xnu.yml') }}
+          restore-keys: |
+            a32-ccache-${{ env.KERNEL_CONFIG }}-
+
+      - name: Fetch darwin-xnu-build and Open Mapple upstream trees
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          # Match Open Mapple mka.sh: arm64 libfirehose + ccache wrappers
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          sed -i '' 's|export CC="$(xcrun -find clang)"|export CC="$CCACHE_WRAP/clang"|; s|export CXX="$(xcrun -find clang++)"|export CXX="$CCACHE_WRAP/clang++"|' dxb/build.sh
+
+          mkdir -p upstream
+          git clone --depth 1 https://github.com/open-mapple/xnu_kernel_mediatek_common.git upstream/xnu_common
+          git clone --depth 1 https://github.com/open-mapple/xnu_kernel_mediatek_mt6781.git upstream/xnu_mt6781
+          git clone --depth 1 https://github.com/open-mapple/mapple_build.git upstream/mapple_build
+          git clone --depth 1 https://github.com/open-mapple/mapple_loader.git upstream/mapple_loader
+
+          # Assemble dxb/xnu = common + mt6781 + our SM-A325M (MT6769T) overlay
+          rm -rf dxb/xnu && mkdir -p dxb/xnu
+          rsync -a --exclude='.git' upstream/xnu_common/ dxb/xnu/
+          rsync -a --exclude='.git' upstream/xnu_mt6781/iokit/ dxb/xnu/iokit/
+          rsync -a --exclude='.git' upstream/xnu_mt6781/osfmk/ dxb/xnu/osfmk/
+
+          python3 kernel/mediatek/mt6768/apply_a32_overlay.py dxb/xnu
+
+          # Stage TargetConditionals.h for -nostdinc staged headers (same as mka.sh)
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          cp "$SDK/usr/include/TargetConditionals.h" dxb/xnu/bsd/pthread/libpthread_staged/
+          cp "$SDK/usr/include/TargetConditionals.h" dxb/xnu/bsd/hfs_staged/
+          sed -i '' 's/^my \$BUILDER=`whoami`;/my $BUILDER="openmapple-a32";/' dxb/xnu/config/newvers.pl
+
+      - name: Build XNU kernel for SM-A325M
+        working-directory: dxb
+        run: |
+          set -o pipefail
+          ccache -z
+          bash build.sh 2>&1 | tee ../xnu-build.log
+          ccache -s
+
+      - name: Publish compiler errors on failure
+        if: failure()
+        run: |
+          if [ -f xnu-build.log ]; then
+            grep -E 'error:|Error:|fatal error:' xnu-build.log | tail -30 | while IFS= read -r line; do
+              printf '::error::%s\n' "${line//'%'/'%25'}"
+            done
+          fi
+
+      - name: Build a32.adt, shim-a32.Image, and MAPPLEPL payload (xnu-a32.bin)
+        run: |
+          mkdir -p dist
+          KL=$(echo "$KERNEL_CONFIG" | tr A-Z a-z)
+          KBIN=$(ls dxb/build/xnu.obj/kernel.${KL}.* 2>/dev/null | grep -v -E '\.(dSYM|unstripped)$' | head -1)
+          test -f "$KBIN" || { echo "::error::Kernel binary not found"; exit 1; }
+          cp "$KBIN" dist/kernel
+
+          # 1) Build SM-A325M Apple Device Tree (a32.adt)
+          python3 upstream/mapple_build/tools/mkadt.py dist/a32.adt \
+            --soc=build/mapple/tools/soc/mt6768.py \
+            --device=device/samsung/a32/adt.py
+
+          # 2) Build SM-A325M bare-metal boot shim (with verified DSI CMD flush + ramoops)
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          python3 tools/build_shim_a32.py \
+            --ref-shim upstream/mapple_loader/shim \
+            --port-shim mapple/loader/shim \
+            --check-abs upstream/mapple_build/tools/check-abs.py \
+            --out dist/shim-a32.Image
+
+          # 3) Pack MAPPLEPL payload (safe Hito 3 early boot cmdline: 1.74 GB top bank, live AMOLED + ramoops)
+          CMDLINE="mp_mem4g=0 mp_cpufreq=0 mp_therm=0 mp_gpu=0 mp_touch=0 mp_wifi_steps=0 mp_bt_steps=0 mp_fb_noconsole=0 mp_conlog=1 cpus=4 debug=0x14e serial=3 -v ${{ inputs.extra_cmdline }}"
+          python3 upstream/mapple_build/tools/mkpayload.py dist/kernel dist/a32.adt dist/xnu-a32.bin --cmdline "$CMDLINE"
+          echo "$CMDLINE" > dist/cmdline.txt
+
+          (cd dist && shasum -a 256 kernel a32.adt shim-a32.Image xnu-a32.bin > SHA256SUMS)
+          ls -lh dist/
+
+      - name: Publish SM-A325M XNU Hito 3 Release (uses 0 Actions artifact storage!)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="hito3-latest"
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          git push origin ":refs/tags/$TAG" 2>/dev/null || true
+          gh release create "$TAG" dist/* \
+            --title "SM-A325M XNU Hito 3 (${KERNEL_CONFIG})" \
+            --notes "Built from commit ${GITHUB_SHA} on macos-15. Contains kernel, a32.adt, shim-a32.Image, xnu-a32.bin, cmdline.txt, SHA256SUMS." \
+            --prerelease

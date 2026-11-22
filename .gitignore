@@ -1,0 +1,12 @@
+*.img
+*.bin
+*.tar
+*.dtb
+*.ipsw
+*.log
+__pycache__/
+out/
+dist/
+dxb/
+upstream/
+fw-*/
