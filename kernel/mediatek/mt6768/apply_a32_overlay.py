@@ -2150,11 +2150,41 @@ btif_put(const uint8_t *b, uint32_t n)
 
     replace_exact(
         wc,
-        """\tfor (int k = 0; k < 4; k++) {
-\t\tn = stp_recv(ev, evmax, ms, &type);""",
-        """\tfor (int k = 0; k < 12; k++) {
-\t\tn = stp_recv(ev, evmax, ms, &type);""",
-        "mt6631_wifi.c: tolerate extra WMT power-saving events in wmt_cmd",
+        """\tif (!stp_send(STP_TYPE_WMT, cmd, clen)) {
+\t\tsay("wmt: %s: BTIF did not take it (LSR 0x%02x)\\n", what, rd(BTIF_LSR) & 0xff);
+\t\t*po = o;
+\t\treturn -1;
+\t}
+\tfor (int k = 0; k < 4; k++) {
+\t\tn = stp_recv(ev, evmax, ms, &type);
+\t\tif (n < 0 || (type == STP_TYPE_WMT && n >= 2 && ev[0] == 0x02 && ev[1] == cmd[1])) {
+\t\t\tbreak;
+\t\t}
+\t\tsay("wmt: %s: other frame type %u, %d bytes (%02x %02x ..)\\n", what, type, n, n > 0 ? ev[0] : 0,
+\t\t    n > 1 ? ev[1] : 0);
+\t}""",
+        """\tfor (int tries = 0; tries < (st.full ? 1 : 3); tries++) {
+\t\t/* MT6768 BTIF requires a rising BTIF_WAK pulse + 20 ms settle before each WMT frame (redwood_connsys wake=2) */
+\t\tbtif_wake();
+\t\tdelay(20000);
+\t\tif (!stp_send(STP_TYPE_WMT, cmd, clen)) {
+\t\t\tsay("wmt: %s: BTIF did not take it (LSR 0x%02x)\\n", what, rd(BTIF_LSR) & 0xff);
+\t\t\t*po = o;
+\t\t\treturn -1;
+\t\t}
+\t\tfor (int k = 0; k < 12; k++) {
+\t\t\tn = stp_recv(ev, evmax, ms, &type);
+\t\t\tif (n < 0 || (type == STP_TYPE_WMT && n >= 2 && ev[0] == 0x02 && ev[1] == cmd[1])) {
+\t\t\t\tbreak;
+\t\t\t}
+\t\t\tsay("wmt: %s: other frame type %u, %d bytes (%02x %02x ..)\\n", what, type, n, n > 0 ? ev[0] : 0,
+\t\t\t    n > 1 ? ev[1] : 0);
+\t\t}
+\t\tif (n >= 0) {
+\t\t\tbreak;
+\t\t}
+\t}""",
+        "mt6631_wifi.c: pulse BTIF_WAK before each WMT frame + retry in mandatory mode",
     )
 
     replace_exact(
@@ -2234,19 +2264,12 @@ stp_send(uint8_t type, const uint8_t *p, uint32_t n)
 \tif (rn < 0) {
 \t\treturn o;
 \t}""",
-        """\tint rn = -1;
-\tfor (int tries = 0; tries < 3 && rn < 0; tries++) {
-\t\tif (tries > 0) {
-\t\t\tbtif_wake();
-\t\t\tdelay(20000);
-\t\t}
-\t\trn = wmt_cmd("read 0x80000008", regrd, sizeof(regrd), regrdEv, sizeof(regrdEv), 1000, ev, sizeof(ev), out, len, &o);
-\t}
+        """\tint rn = wmt_cmd("read 0x80000008", regrd, sizeof(regrd), regrdEv, sizeof(regrdEv), 1500, ev, sizeof(ev), out, len, &o);
 \tif (rn < 0) {
 \t\treturn o;
 \t}
 \tdelay(10000);""",
-        "mt6631_wifi.c: retry initial WMT read 0x80000008 up to 3 times + 10 ms settle",
+        "mt6631_wifi.c: 1500 ms timeout + 10 ms settle after read 0x80000008",
     )
 
     replace_exact(
@@ -2311,9 +2334,6 @@ stp_send(uint8_t type, const uint8_t *p, uint32_t n)
 \t\tuint32_t body = pf.size - 30, target = 0;
 \t\tmemcpy(&target, pbuf + 24, 4);
 \t\ttarget &= ~0xffu; /* 0x0001c011 -> 0x0001c000 */
-\t\t/* Pull BTIF_WAK low before PDA patch so RAM handover does not take a spurious wake IRQ */
-\t\trmw(BTIF_WAK, 1, 0);
-\t\tdelay(5000);
 \t\tuint8_t pda[21] = {
 \t\t\t0x01, 0x01, 0x11, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2f, 0x02, 0x02, 0x00,
 \t\t};
