@@ -2034,7 +2034,7 @@ static struct {
 #define STP_TYPE_BT             0
 
 static struct {
-\tbool     full, dmaOn;
+\tbool     full, dmaOn, wakeLow;
 \tuint8_t  txseq, txack, rxseq;
 \tuint16_t crc[256];
 \tuint8_t *vff;
@@ -2167,6 +2167,7 @@ btif_put(const uint8_t *b, uint32_t n)
 \tbtif_dma_init();
 \twr(BTIF_DMA_EN, st.dmaOn ? ((1u << 2) | (1u << 1)) : (1u << 2));
 \twr(BTIF_IER, 0);                                /* polled */
+\tst.wakeLow = false;
 \tbtif_wake();
 \tdelay(20000);""",
         "mt6631_wifi.c: direct FIFOCTRL writes, BTIF TX AP-DMA, and 20 ms post-wake delay in btif_init",
@@ -2229,7 +2230,7 @@ btif_get(uint32_t us)
 \t\t    n > 1 ? ev[1] : 0);
 \t}""",
         """\tfor (int tries = 0; tries < (st.full ? 1 : 3); tries++) {
-\t\tif (tries > 0) {
+\t\tif (tries > 0 && !st.wakeLow) {
 \t\t\tbtif_wake();
 \t\t\tdelay(20000);
 \t\t}
@@ -2330,12 +2331,12 @@ stp_send(uint8_t type, const uint8_t *p, uint32_t n)
 \tif (rn < 0) {
 \t\treturn o;
 \t}""",
-        """\tint rn = wmt_cmd("read 0x80000008", regrd, sizeof(regrd), regrdEv, sizeof(regrdEv), 1500, ev, sizeof(ev), out, len, &o);
+        """\tint rn = wmt_cmd("read 0x80000008", regrd, sizeof(regrd), regrdEv, sizeof(regrdEv), 2500, ev, sizeof(ev), out, len, &o);
 \tif (rn < 0) {
 \t\treturn o;
 \t}
 \tdelay(10000);""",
-        "mt6631_wifi.c: 1500 ms timeout + 10 ms settle after read 0x80000008",
+        "mt6631_wifi.c: 2500 ms timeout + 10 ms settle after read 0x80000008",
     )
 
     replace_exact(
@@ -2406,7 +2407,11 @@ stp_send(uint8_t type, const uint8_t *p, uint32_t n)
 \t\tstatic const uint8_t pdaEv[] = { 0x02, 0x01, 0x01, 0x00, 0x00 };
 \t\tmemcpy(pda + 5, &target, 4);
 \t\tmemcpy(pda + 9, &body, 4);
-\t\tif (wmt_cmd("pda cfg", pda, sizeof(pda), pdaEv, sizeof(pdaEv), 1000, ev, sizeof(ev), out, len, &o) < 0) {
+\t\t/* Lower BTIF_WAK BEFORE PDA patch so RAM image does not take pending IRQ 8 on handover (redwood_connsys:1148) */
+\t\trmw(BTIF_WAK, 1, 0);
+\t\tst.wakeLow = true;
+\t\tdelay(5000);
+\t\tif (wmt_cmd("pda cfg", pda, sizeof(pda), pdaEv, sizeof(pdaEv), 1500, ev, sizeof(ev), out, len, &o) < 0) {
 \t\t\treturn o;
 \t\t}
 \t\tuint8_t head[12] = { 0 };
@@ -2430,7 +2435,7 @@ stp_send(uint8_t type, const uint8_t *p, uint32_t n)
 \t\tsay("wmt: PDA patch %u bytes -> 0x%08x sent (pc 0x%08x)\\n", body, target, rd(CONN_MCU_PC));
 \t\tstatic const uint8_t rst[] = { 0x01, 0x07, 0x01, 0x00, 0x04 };
 \t\tstatic const uint8_t rstEv[] = { 0x02, 0x07, 0x01, 0x00, 0x00 };
-\t\tif (wmt_cmd("wmt reset", rst, sizeof(rst), rstEv, sizeof(rstEv), 2000, ev, sizeof(ev), out, len, &o) < 0) {
+\t\tif (wmt_cmd("wmt reset", rst, sizeof(rst), rstEv, sizeof(rstEv), 3000, ev, sizeof(ev), out, len, &o) < 0) {
 \t\t\treturn o;
 \t\t}
 \t}
@@ -2444,8 +2449,10 @@ stp_send(uint8_t type, const uint8_t *p, uint32_t n)
 \t\treturn o;
 \t}
 \tst.full = true;                                 /* host side switch, 10 ms */
+\tst.wakeLow = false;
 \tst.txseq = 0;
 \tst.txack = 7;
+\tst.rxseq = 0;
 \tdelay(10000);
 \tif (wmt_cmd("query stp (full)", qstp, sizeof(qstp), qstpFull, sizeof(qstpFull), 1000, ev, sizeof(ev), out, len,
 \t    &o) < 0) {
