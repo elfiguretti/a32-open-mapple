@@ -1987,7 +1987,6 @@ pinmux_restore(void)
 \trmw(CONN_XO_1204, 0xff01, 0x0600);
 \trmw(CONN_SW_IRQ_REG, 1u << 21, 0);
 \trmw(CONN_TOPPOSE_RESTORE, 1u << 23, 1u << 23);
-\twr(CONN_BUSHANGCR, 0x90000002);
 \trmw(TOPRGU_SWSYSRST, 0xff001000, 0x88000000);           /* CPU out of reset */
 \t{
 \t\tbool idle = false;
@@ -1997,6 +1996,9 @@ pinmux_restore(void)
 \t\t}
 \t\tfor (uint32_t k = 0; idle && k < 100 && rd(CONN_MCU_PC) != 0xb04; k++) {
 \t\t\tdelay(10000);
+\t\t}
+\t\tif (idle) {
+\t\t\tdelay(20000);
 \t\t}
 \t\tsay("on: MCU %s after ~%u ms: com_reg0 0x%08x, pc 0x%08x, dbg 0x%08x\\n", idle ? "IDLE LOOP" :
 \t\t    "NOT IDLE", t * 10, rd(CONN_MCU_COM_REG0), rd(CONN_MCU_PC), rd(CONN_MCU_DBG_216C));
@@ -2335,8 +2337,11 @@ stp_send(uint8_t type, const uint8_t *p, uint32_t n)
 \tif (rn < 0) {
 \t\treturn o;
 \t}
-\tdelay(10000);""",
-        "mt6631_wifi.c: 2500 ms timeout + 10 ms settle after read 0x80000008",
+\tdelay(15000);
+\twhile (rd(BTIF_LSR) & LSR_DR) {
+\t\t(void)rd(BTIF_RBR);
+\t}""",
+        "mt6631_wifi.c: 2500 ms timeout + settle + RX drain after read 0x80000008",
     )
 
     replace_exact(
@@ -2417,10 +2422,12 @@ stp_send(uint8_t type, const uint8_t *p, uint32_t n)
 \t\tuint8_t head[12] = { 0 };
 \t\tuint32_t hlen = body + 12;
 \t\tmemcpy(head, &hlen, 4);
+\t\tuint32_t pc0 = rd(CONN_MCU_PC);
 \t\tbool txok = btif_put(head, sizeof(head));
 \t\tfor (uint32_t at = 0; txok && at < body; at += 1000) {
 \t\t\ttxok = btif_put(pbuf + 30 + at, MIN(1000u, body - at));
 \t\t}
+\t\tuint32_t pc1 = rd(CONN_MCU_PC);
 \t\tif (!txok) {
 \t\t\tsay("wmt: PDA patch stream failed (LSR 0x%02x)\\n", rd(BTIF_LSR) & 0xff);
 \t\t\treturn o;
@@ -2432,7 +2439,9 @@ stp_send(uint8_t type, const uint8_t *p, uint32_t n)
 \t\tmemcpy((char *)vw.emi + 0x68330, dt, 16);
 \t\tmt6631_wifi_emi_flush(0x68300, 64);
 \t\tdelay(50000);
-\t\tsay("wmt: PDA patch %u bytes -> 0x%08x sent (pc 0x%08x)\\n", body, target, rd(CONN_MCU_PC));
+\t\tsay("wmt: PDA patch %u bytes -> 0x%08x sent (pc 0x%x -> 0x%x -> 0x%x)\\n", body, target, pc0, pc1, rd(CONN_MCU_PC));
+\t\t/* Allow wake retry on WMT reset (try 0 sends with BTIF_WAK=0, try 1/2 pulses BTIF_WAK like redwood wake=2) */
+\t\tst.wakeLow = false;
 \t\tstatic const uint8_t rst[] = { 0x01, 0x07, 0x01, 0x00, 0x04 };
 \t\tstatic const uint8_t rstEv[] = { 0x02, 0x07, 0x01, 0x00, 0x00 };
 \t\tif (wmt_cmd("wmt reset", rst, sizeof(rst), rstEv, sizeof(rstEv), 3000, ev, sizeof(ev), out, len, &o) < 0) {
