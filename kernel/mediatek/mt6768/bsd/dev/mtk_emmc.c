@@ -37,6 +37,7 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void usblink_probe(void);
 extern kern_return_t thread_terminate(thread_t thread);
+static void emmc_reloc_boot_sync(void);
 
 #define MSDC0_PHYS              0x11230000UL
 #define EMMC_DEFAULT_PART       "xnusys"
@@ -890,6 +891,15 @@ mtk_emmc_init(void)
 	emmc_ready = true;
 	lck_mtx_unlock(&mtk_emmc_lock);
 
+	{
+		int do_reloc = 0;
+		if (!emmc_writable &&
+		    PE_parse_boot_argn("a32_reloc107g", &do_reloc, sizeof(do_reloc)) &&
+		    do_reloc == 1) {
+			emmc_reloc_boot_sync();
+		}
+	}
+
 	emmc_bmajor = bdevsw_add(-1, &mtk_emmc_bdevsw);
 	if (emmc_bmajor < 0 ||
 	    (emmc_cmajor = cdevsw_add_with_bdev(-1, &mtk_emmc_cdevsw, emmc_bmajor)) < 0) {
@@ -1000,7 +1010,7 @@ emmc_reloc_write_locked(uint64_t lba, uint32_t blocks, const uint32_t *src)
 }
 
 static void
-emmc_reloc_worker(__unused void *arg, __unused wait_result_t wr)
+emmc_reloc_do_work(void)
 {
 	static uint32_t buf[EMMC_MAX_BLOCKS * 128] __attribute__((aligned(64)));
 	static uint8_t pri[15 * 512] __attribute__((aligned(64)));
@@ -1022,14 +1032,15 @@ emmc_reloc_worker(__unused void *arg, __unused wait_result_t wr)
 		if (!ok) {
 			snprintf(reloc107.msg, sizeof(reloc107.msg), "copy failed at LBA +%llu (%s %#x)",
 			    done, emmc_failed ? emmc_failed : "?", emmc_failed_status);
+			printf("emmc: relocate107g ERROR: %s\n", reloc107.msg);
 			reloc107.state = -1;
-			thread_terminate(current_thread());
 			return;
 		}
 		done += n;
 		reloc107.done_sec = done;
-		if ((done & ((1ULL << 21) - 1)) == 0) {
-			printf("emmc: relocate107g %llu / %llu MiB\n", (done * 512ULL) >> 20, (total * 512ULL) >> 20);
+		if ((done & ((1ULL << 20) - 1)) == 0 || done == total) {
+			printf("emmc: relocate107g %llu / %llu MiB (DMA=%u)\n",
+			    (done * 512ULL) >> 20, (total * 512ULL) >> 20, emmc_dma_ok ? 1u : 0u);
 		}
 	}
 
@@ -1042,10 +1053,11 @@ emmc_reloc_worker(__unused void *arg, __unused wait_result_t wr)
 	lck_mtx_unlock(&mtk_emmc_lock);
 	if (!vok || memcmp(vh_src, vh_dst, 512) != 0 || memcmp(alt_src, alt_dst, 512) != 0) {
 		snprintf(reloc107.msg, sizeof(reloc107.msg), "HFSX header verify mismatch! GPT NOT modified.");
+		printf("emmc: relocate107g ERROR: %s\n", reloc107.msg);
 		reloc107.state = -1;
-		thread_terminate(current_thread());
 		return;
 	}
+	printf("emmc: relocate107g HFSX Primary+Alternate headers verified bit-for-bit!\n");
 
 	/* Read live Primary (LBA 1..15) + Backup (LBA 244285407..244285439) GPT, patch slot #49 & #50, recompute CRCs */
 	lck_mtx_lock(&mtk_emmc_lock);
@@ -1109,15 +1121,59 @@ emmc_reloc_worker(__unused void *arg, __unused wait_result_t wr)
 	}
 	lck_mtx_unlock(&mtk_emmc_lock);
 	if (!gok) {
+		printf("emmc: relocate107g ERROR: %s\n", reloc107.msg);
 		reloc107.state = -1;
-		thread_terminate(current_thread());
 		return;
 	}
-	snprintf(reloc107.msg, sizeof(reloc107.msg), "DONE! Relocated %llu MiB + wrote 107.35 GiB GPT. Reboot into RW kernel and run growfs 0x1ad4000000",
+	snprintf(reloc107.msg, sizeof(reloc107.msg), "DONE! Relocated %llu MiB + wrote 107.35 GiB GPT. Put device in Download Mode and flash RW kernel!",
 	    (total * 512ULL) >> 20);
 	printf("emmc: relocate107g: %s\n", reloc107.msg);
 	reloc107.state = 2;
+}
+
+static void
+emmc_reloc_worker(__unused void *arg, __unused wait_result_t wr)
+{
+	emmc_reloc_do_work();
 	thread_terminate(current_thread());
+}
+
+static void
+emmc_reloc_boot_sync(void)
+{
+	printf("emmc: a32_reloc107g=1 pre-mount relocation starting (zero filesystems mounted)...\n");
+	if (emmc_lba != 160391168ULL || emmc_part_blocks != 83886080ULL) {
+		printf("emmc: relocate107g: xnusys @ LBA %llu (%llu MiB) -- already relocated or unexpected!\n",
+		    emmc_lba, (emmc_part_blocks * 512ULL) >> 20);
+		for (;;) {
+			delay(1000000);
+		}
+	}
+	uint32_t vh[128];
+	lck_mtx_lock(&mtk_emmc_lock);
+	bool ok = emmc_read_retrying(emmc_lba + 2, 1, vh);
+	lck_mtx_unlock(&mtk_emmc_lock);
+	const uint8_t *b = (const uint8_t *)vh;
+	uint16_t sig = (uint16_t)((uint16_t)b[0] << 8 | b[1]);
+	uint32_t bsz = (uint32_t)b[40] << 24 | (uint32_t)b[41] << 16 | (uint32_t)b[42] << 8 | b[43];
+	uint32_t tot = (uint32_t)b[44] << 24 | (uint32_t)b[45] << 16 | (uint32_t)b[46] << 8 | b[47];
+	uint64_t vol_sec = ((uint64_t)tot * bsz) / 512ULL;
+	if (!ok || sig != 0x4858u || bsz != 4096u || vol_sec == 0 || vol_sec > emmc_part_blocks) {
+		printf("emmc: relocate107g: bad HFSX header (sig=0x%04x bsz=%u tot=%u)\n", sig, bsz, tot);
+		for (;;) {
+			delay(1000000);
+		}
+	}
+	reloc107.done_sec = 0;
+	reloc107.total_sec = vol_sec;
+	reloc107.state = 1;
+	printf("emmc: relocate107g: copying %llu MiB (LBA 160391168 -> 19144704, DMA=%u)...\n",
+	    (vol_sec * 512ULL) >> 20, emmc_dma_ok ? 1u : 0u);
+	emmc_reloc_do_work();
+	printf("emmc: relocate107g finished (state=%d). Hold Vol- + Power -> Vol+ + Vol- for Download Mode.\n", reloc107.state);
+	for (;;) {
+		delay(1000000);
+	}
 }
 
 void mtk_emmc_relocate_107g_link(const char *args, char *out, size_t len);
