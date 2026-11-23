@@ -2712,7 +2712,64 @@ stp_send(uint8_t type, const uint8_t *p, uint32_t n)
         "mt6631_wifi.c: CONNAC1 16-byte RXD in wifi_event",
     )
 
-    # CONNAC1 WTBL, TXD, unencrypted EAPOL over TX ring 15, CH_PRIVILEGE event offset, STAREC v1, RSC in hw_key
+    # CONNAC1 WTBL, TXD, unencrypted EAPOL over TX ring 15, CH_PRIVILEGE event offset, STAREC v1, join order, RSC in hw_key
+    replace_exact(
+        wc,
+        """\tstatic const uint8_t wmm_oui[4] = { 0x00, 0x50, 0xf2, 0x02 };
+\tsj.ht = ie_find(e->ie, e->ie_len, 45, NULL) != NULL;
+\tsj.wmm = ie_find(e->ie, e->ie_len, 0xdd, wmm_oui) != NULL;""",
+        """\t/* CONNAC1 (MT6768): match redwood_mtkwifi.c (legacy 802.11a/g on LMAC AC0; avoid HT/WMM queue set mismatch) */
+\tsj.ht = false;
+\tsj.wmm = false;""",
+        "mt6631_wifi.c: disable HT/WMM negotiation on CONNAC1 (match redwood_mtkwifi.c)",
+    )
+
+    replace_exact(
+        wc,
+        """\tsj.chHeld = true;
+\tif (hw_sta_rec(1) != 0) {""",
+        """\tsj.chHeld = true;
+\t(void)hw_bss_info(false);
+\tif (hw_sta_rec(1) != 0) {""",
+        "mt6631_wifi.c: send hw_bss_info(false) before hw_sta_rec(1) (CONNAC1)",
+    )
+
+    replace_exact(
+        wc,
+        """\tsj.aid = (uint16_t)((sj.mgmt[28] | sj.mgmt[29] << 8) & 0x3fff);
+\t{
+\t\t/* what the AP agreed to: HT only if its response carries HT capabilities, WMM if it has the parameter IE */
+\t\tstatic const uint8_t wmm_param[4] = { 0x00, 0x50, 0xf2, 0x02 };
+\t\tconst uint8_t *ies = sj.mgmt + 30;
+\t\tuint32_t il = n - 30;
+\t\tsj.ht = sj.ht && ie_find(ies, il, 45, NULL) != NULL;
+\t\tsj.wmm = sj.wmm && ie_find(ies, il, 0xdd, wmm_param) != NULL;
+\t}
+\thw_wmm();
+\tif (hw_bss_info(true) != 0 || hw_sta_rec(3) != 0) {
+\t\tsta_fail(2, "firmware refused the connected state", out, len, &o);
+\t\tgoto done;
+\t}
+\thw_pm_connected(true);""",
+        """\tsj.aid = (uint16_t)((sj.mgmt[28] | sj.mgmt[29] << 8) & 0x3fff);
+\tsj.ht = false;
+\tsj.wmm = false;
+\tif (sj.wmm) {
+\t\thw_wmm();
+\t}
+\t/* CONNAC1 (redwood_mtkwifi.c): STA_STATE_3 BEFORE BSS_INFO(connected), then PM_CONNECTED + CAM, then release CH */
+\tif (hw_sta_rec(3) != 0 || hw_bss_info(true) != 0) {
+\t\tsta_fail(2, "firmware refused the connected state", out, len, &o);
+\t\tgoto done;
+\t}
+\thw_pm_connected(true);
+\tif (sj.chHeld) {
+\t\t(void)hw_ch_privilege(false);
+\t\tsj.chHeld = false;
+\t}""",
+        "mt6631_wifi.c: CONNAC1 post-assoc order (STAREC3 -> BSS_INFO -> PM/CAM -> release CH)",
+    )
+
     replace_exact(
         wc,
         """#define WTBL_AP                 5
@@ -2724,15 +2781,29 @@ stp_send(uint8_t type, const uint8_t *p, uint32_t n)
 
     replace_exact(
         wc,
+        """\t\tif ((oper & 0x000f) && !(basic & 0x3fc0)) {
+\t\t\tp |= 0x01;                      /* HR/DSSS */
+\t\t}""",
+        """\t\t(void)basic;
+\t\tif (oper & 0x000f) {
+\t\t\tp |= 0x01;                      /* HR/DSSS (CONNAC1: 0x03 for b/g) */
+\t\t}""",
+        "mt6631_wifi.c: include HR/DSSS bit in phy_set on 2.4 GHz (match redwood_mtkwifi.c)",
+    )
+
+    replace_exact(
+        wc,
         """\tt[3] = 0x04;                                    /* LMAC, queue 1 = AC_BE (WMM set 0) */
 \tt[4] = WTBL_AP;
 \tt[5] = type >= 0x600 ? 0x90 : 0x80;             /* long, non-802.11, Ethernet II */
-\tt[7] = 0x04;                                    /* PktFt 0, own MAC 1 */""",
+\tt[7] = 0x04;                                    /* PktFt 0, own MAC 1 */
+\tput16(t + 12, 0xf000 | (protect ? 0x0002 : 0));""",
         """\tt[3] = 0x00;                                    /* CONNAC1: LMAC AC0 */
 \tt[4] = WTBL_AP;
 \tt[5] = type >= 0x600 ? 0x90 : 0x80;             /* long, non-802.11, Ethernet II */
-\tt[7] = 0x00;                                    /* CONNAC1: PktFt 0, own MAC 0 */""",
-        "mt6631_wifi.c: CONNAC1 OMAC=0 and AC0 in tx_data",
+\tt[7] = 0x00;                                    /* CONNAC1: PktFt 0, own MAC 0 */
+\tput16(t + 12, (15u << 11) | (protect ? 0x0002 : 0));""",
+        "mt6631_wifi.c: CONNAC1 OMAC=0, AC0, and 15-try limit (0x7802) in tx_data",
     )
 
     replace_exact(
@@ -2822,13 +2893,102 @@ hw_tx(const uint8_t *frame, uint32_t len, bool mgmt, bool protect)
 
     replace_exact(
         wc,
-        """\tp[54] = WTBL_AP;
-\tp[55] = 0xff;""",
-        """\tp[23] = 1;                                      /* CONNAC1: CMD_UPDATE_STAREC_VER1 */
+        """static int
+hw_sta_rec(uint8_t state)
+{
+\tuint8_t p[168], ev[128];
+\tstatic char junk[256];
+\tsize_t o = 0;
+\tuint16_t oper, basic;
+\trate_sets(&oper, &basic);
+\tbzero(p, sizeof(p));
+\tp[0] = STA_IDX_AP;
+\tp[1] = 0x41;                                    /* legacy AP */
+\tmemcpy(p + 2, sj.ap.bssid, 6);
+\tp[12] = 0;                                      /* BSS 0 */
+\tp[13] = phy_set();
+\tput16(p + 14, oper & 0x3fcf);
+\tput16(p + 16, basic);
+\tp[54] = WTBL_AP;
+\tp[55] = 0xff;
+\tp[68] = 3;                                      /* RTS policy legacy */
+\tput16(p + 74, rate_code());
+\tp[76] = 0;                                      /* no TX A-MPDU (0153: the data queue stalled under load) */
+\tp[77] = 0;                                      /* no RX block ack: we do not reorder */
+\tput32(p + 88, 0x10);
+\tp[92] = 0x40;
+\tp[128] = 1;
+\tp[129] = 1;
+\tput32(p + 132, 8192);
+\tif (state != 3) {
+\t\tp[20] = 0;                              /* STA_STATE_1 */
+\t\treturn cmd_set(CID_UPDATE_STA_RECORD, p, sizeof(p));
+\t}
+\tp[20] = 2;                                      /* STA_STATE_3 */
+\tp[51] = 1;                                      /* answer with EVENT_ACTIVATE_STA_REC */
+\tput16(p + 8, sj.aid);
+\tput16(p + 10, 10);                              /* as in our association request */
+\tp[18] = (sj.wmm || sj.ht) ? 1 : 0;
+\tif (sj.ht && sj.mgmtLen > 30) {
+\t\tconst uint8_t *h = ie_find(sj.mgmt + 30, sj.mgmtLen - 30, 45, NULL);
+\t\tif (h && h[1] == 26) {
+\t\t\tput16(p + 40, (uint32_t)(h[2] | h[3] << 8));    /* HT cap info */
+\t\t\tp[48] = h[4];                                   /* A-MPDU parameters */
+\t\t\tp[21] = h[5];                                   /* MCS 0-7 */
+\t\t\tp[22] = h[9] & 1;                               /* MCS 32 */
+\t\t\tmemcpy(p + 24, h + 5, 10);
+\t\t\tput16(p + 34, (uint32_t)(h[15] | h[16] << 8) & 0x3ff);
+\t\t\tp[36] = h[17];
+\t\t\tput16(p + 42, (uint32_t)(h[21] | h[22] << 8));
+\t\t\tmemcpy(p + 44, h + 23, 4);
+\t\t\tp[49] = h[27];
+\t\t}
+\t}
+\tint n = wifi_cmd(CID_UPDATE_STA_RECORD, true, p, sizeof(p), EID_ACTIVATE_STA_REC, ev, sizeof(ev), 1000, junk,
+\t    sizeof(junk), &o);
+\tif (n < 0) {
+\t\tprintf("WIFI: STA record (state 3): no EVENT_ACTIVATE_STA_REC, going on\\n");
+\t}
+\treturn 0;
+}
+
+static void
+hw_sta_remove(void)
+{
+\tuint8_t p[4] = { 1, 27, 0, 0 };                 /* every record of BSS 0 */
+\t(void)cmd_set(CID_REMOVE_STA_RECORD, p, sizeof(p));
+}""",
+        """static int
+hw_sta_rec(uint8_t state)
+{
+\tuint8_t p[168];
+\tuint16_t oper, basic;
+\trate_sets(&oper, &basic);
+\tbzero(p, sizeof(p));
+\tp[0] = STA_IDX_AP;
+\tp[1] = 0x41;                                    /* STA_TYPE_LEGACY_AP */
+\tmemcpy(p + 2, sj.ap.bssid, 6);
+\tput16(p + 8, sj.aid);
+\tput16(p + 10, 10);                              /* listen interval */
+\tp[12] = 0;                                      /* BSS 0 */
+\tp[13] = phy_set();
+\tput16(p + 14, oper);
+\tput16(p + 16, basic);
+\tp[20] = (state == 3) ? 2 : 0;                   /* STA_STATE_1 / STA_STATE_3 */
+\tp[23] = 1;                                      /* CONNAC1: CMD_UPDATE_STAREC_VER1 */
 \tp[50] = (uint8_t)((sj.ap.rssi + 110) * 2);      /* RCPI */
 \tp[54] = WTBL_AP;
-\tp[55] = WTBL_BMC;""",
-        "mt6631_wifi.c: CONNAC1 STAREC_VER1, RCPI, and WTBL_BMC in hw_sta_rec",
+\tp[55] = WTBL_BMC;
+\treturn cmd_set(CID_UPDATE_STA_RECORD, p, sizeof(p));
+}
+
+static void
+hw_sta_remove(void)
+{
+\tuint8_t p[4] = { 0, 0, 0, 0 };                  /* CONNAC1: STA_REC_CMD_ACTION_STA, record 0, BSS 0 */
+\t(void)cmd_set(CID_REMOVE_STA_RECORD, p, sizeof(p));
+}""",
+        "mt6631_wifi.c: CONNAC1 clean hw_sta_rec (drop CONNAC2 fields) and hw_sta_remove",
     )
 
     replace_exact(
