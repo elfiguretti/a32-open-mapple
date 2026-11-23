@@ -1761,6 +1761,35 @@ pinmux_restore(void)
 
     replace_exact(
         wc,
+        """static LCK_GRP_DECLARE(btif_lck_grp, "mt6631_btif");
+static LCK_MTX_DECLARE(btif_mtx, &btif_lck_grp);       /* BTIF and st: "wifi wmt" and Bluetooth (bsd/dev/mtk_bt.c) */
+
+static size_t
+wifi_off(char *out, size_t len, size_t o)""",
+        """static LCK_GRP_DECLARE(btif_lck_grp, "mt6631_btif");
+static LCK_MTX_DECLARE(btif_mtx, &btif_lck_grp);       /* BTIF and st: "wifi wmt" and Bluetooth (bsd/dev/mtk_bt.c) */
+static void btif_init(void);
+static void btif_mark_down(void);
+
+static size_t
+wifi_off(char *out, size_t len, size_t o)""",
+        "mt6631_wifi.c: forward-declare btif_init/btif_mark_down for pre-boot BTIF init",
+    )
+
+    replace_exact(
+        wc,
+        """\tlck_mtx_lock(&btif_mtx);
+\tvw.wmt = false;                                 /* Bluetooth stops touching BTIF before CONNSYS goes */
+\tlck_mtx_unlock(&btif_mtx);""",
+        """\tlck_mtx_lock(&btif_mtx);
+\tvw.wmt = false;                                 /* Bluetooth stops touching BTIF before CONNSYS goes */
+\tbtif_mark_down();
+\tlck_mtx_unlock(&btif_mtx);""",
+        "mt6631_wifi.c: mark BTIF down in wifi_off",
+    )
+
+    replace_exact(
+        wc,
         """\tbzero(vw.emi, EMI_SIZE);
 \tmt6631_wifi_emi_flush(0, EMI_SIZE);
 \tsay("on: EMI window PA 0x%llx (%s aligned), MCU sees it at 0x%08x\\n", vw.emiPA,
@@ -1987,6 +2016,8 @@ pinmux_restore(void)
 \trmw(CONN_XO_1204, 0xff01, 0x0600);
 \trmw(CONN_SW_IRQ_REG, 1u << 21, 0);
 \trmw(CONN_TOPPOSE_RESTORE, 1u << 23, 1u << 23);
+\t/* Initialize AP BTIF + TX AP-DMA BEFORE releasing CONNSYS CPU reset (matches Android btif_plat.c) */
+\tbtif_init();
 \trmw(TOPRGU_SWSYSRST, 0xff001000, 0x88000000);           /* CPU out of reset */
 \t{
 \t\tbool idle = false;
@@ -2036,12 +2067,20 @@ static struct {
 #define STP_TYPE_BT             0
 
 static struct {
-\tbool     full, dmaOn, wakeLow;
+\tbool     full, dmaOn, wakeLow, btifReady;
 \tuint8_t  txseq, txack, rxseq;
 \tuint16_t crc[256];
 \tuint8_t *vff;
 \tuint32_t vffPA, wpt, wrap;
-} st;""",
+} st;
+
+static void
+btif_mark_down(void)
+{
+\tst.btifReady = false;
+\tst.full = false;
+\tst.wakeLow = false;
+}""",
         "mt6631_wifi.c: BTIF TX AP-DMA defines and state",
     )
 
@@ -2123,6 +2162,7 @@ btif_put(const uint8_t *b, uint32_t n)
 \t\t\t}
 \t\t\tat += chunk;
 \t\t\t__builtin_arm_dsb(0xf);
+\t\t\tmt6631_wifi_dma_flush(OFF_BTIF_TX, BTIF_TX_VFF_SZ);
 \t\t\trmw(BTIF_TX_DMA_BASE + 0x08, 1u, 1u);
 \t\t\twr(BTIF_TX_DMA_BASE + 0x2c, st.wpt | st.wrap);
 \t\t\tuint32_t valid = rd(BTIF_TX_DMA_BASE + 0x3c);
@@ -2169,10 +2209,10 @@ btif_put(const uint8_t *b, uint32_t n)
 \tbtif_dma_init();
 \twr(BTIF_DMA_EN, st.dmaOn ? ((1u << 2) | (1u << 1)) : (1u << 2));
 \twr(BTIF_IER, 0);                                /* polled */
+\trmw(BTIF_WAK, 1, 0);                            /* keep WAK low during CONNSYS boot; wmt_cmd wakes per frame */
 \tst.wakeLow = false;
-\tbtif_wake();
-\tdelay(20000);""",
-        "mt6631_wifi.c: direct FIFOCTRL writes, BTIF TX AP-DMA, and 20 ms post-wake delay in btif_init",
+\tst.btifReady = true;""",
+        "mt6631_wifi.c: direct FIFOCTRL writes, BTIF TX AP-DMA, WAK low in btif_init",
     )
 
     replace_exact(
@@ -2232,9 +2272,14 @@ btif_get(uint32_t us)
 \t\t    n > 1 ? ev[1] : 0);
 \t}""",
         """\tfor (int tries = 0; tries < (st.full ? 1 : 3); tries++) {
-\t\tif (tries > 0 && !st.wakeLow) {
-\t\t\tbtif_wake();
-\t\t\tdelay(20000);
+\t\tif (!st.full) {
+\t\t\twhile (rd(BTIF_LSR) & LSR_DR) {
+\t\t\t\t(void)rd(BTIF_RBR);
+\t\t\t}
+\t\t\tif (!st.wakeLow) {
+\t\t\t\tbtif_wake();
+\t\t\t\tdelay(20000);
+\t\t\t}
 \t\t}
 \t\tif (!stp_send(STP_TYPE_WMT, cmd, clen)) {
 \t\t\tsay("wmt: %s: BTIF did not take it (LSR 0x%02x)\\n", what, rd(BTIF_LSR) & 0xff);
@@ -2325,6 +2370,19 @@ stp_send(uint8_t type, const uint8_t *p, uint32_t n)
 \t\t\t}
 \t\t}""",
         "mt6631_wifi.c: handle duplicate STP frames cleanly in full mode",
+    )
+
+    replace_exact(
+        wc,
+        """\tbtif_init();
+\tsay("wmt: BTIF clock %s, LSR 0x%02x\\n", (rd(INFRA_CG0_STA) & INFRA_CG0_BTIF) ? "STILL GATED" : "on",
+\t    rd(BTIF_LSR) & 0xff);""",
+        """\tif (!st.btifReady) {
+\t\tbtif_init();
+\t}
+\tsay("wmt: BTIF clock %s, LSR 0x%02x, dma %u\\n", (rd(INFRA_CG0_STA) & INFRA_CG0_BTIF) ? "STILL GATED" : "on",
+\t    rd(BTIF_LSR) & 0xff, st.dmaOn ? 1 : 0);""",
+        "mt6631_wifi.c: reuse pre-boot BTIF+AP-DMA in wmt_up without mid-flight reset",
     )
 
     replace_exact(
@@ -2439,8 +2497,8 @@ stp_send(uint8_t type, const uint8_t *p, uint32_t n)
 \t\tmemcpy((char *)vw.emi + 0x68330, dt, 16);
 \t\tmt6631_wifi_emi_flush(0x68300, 64);
 \t\tdelay(50000);
-\t\tsay("wmt: PDA patch %u bytes -> 0x%08x sent (pc 0x%x -> 0x%x -> 0x%x)\\n", body, target, pc0, pc1, rd(CONN_MCU_PC));
-\t\t/* Allow wake retry on WMT reset (try 0 sends with BTIF_WAK=0, try 1/2 pulses BTIF_WAK like redwood wake=2) */
+\t\tsay("wmt: PDA patch %u bytes -> 0x%08x sent (pc 0x%x -> 0x%x -> 0x%x, pda 0x%x)\\n", body, target, pc0, pc1, rd(CONN_MCU_PC), rd(0x180a9008));
+\t\t/* Re-enable BTIF_WAK pulse for WMT reset (try 0 wakes CONNSYS like redwood wake=2) */
 \t\tst.wakeLow = false;
 \t\tstatic const uint8_t rst[] = { 0x01, 0x07, 0x01, 0x00, 0x04 };
 \t\tstatic const uint8_t rstEv[] = { 0x02, 0x07, 0x01, 0x00, 0x00 };
