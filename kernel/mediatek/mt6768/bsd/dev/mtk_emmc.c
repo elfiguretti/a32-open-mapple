@@ -18,6 +18,7 @@
 #include <arm/caches_internal.h>
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
@@ -35,6 +36,7 @@
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void usblink_probe(void);
+extern kern_return_t thread_terminate(thread_t thread);
 
 #define MSDC0_PHYS              0x11230000UL
 #define EMMC_DEFAULT_PART       "xnusys"
@@ -918,5 +920,257 @@ mtk_emmc_rootdev(dev_t *dev)
 	}
 	*dev = emmc_bdev;
 	return 0;
+}
+
+/* ---- One-shot PIT-safe 107.35 GiB xnusys relocation (RO boot only, explicit USB command) ---- */
+
+static struct {
+	int      state;          /* 0=idle, 1=running, 2=done, -1=error */
+	uint64_t done_sec, total_sec;
+	char     msg[160];
+} reloc107;
+
+static uint32_t
+reloc_crc32(const uint8_t *buf, size_t len)
+{
+	uint32_t c = 0xffffffffu;
+	for (size_t i = 0; i < len; i++) {
+		c ^= buf[i];
+		for (int b = 0; b < 8; b++) {
+			c = (c & 1u) ? ((c >> 1) ^ 0xedb88320u) : (c >> 1);
+		}
+	}
+	return c ^ 0xffffffffu;
+}
+
+/* Raw write strictly fenced to the relocation target [19144704..160391167] or GPT sectors 1..15 / 244285407..244285439. */
+static bool
+emmc_reloc_write_locked(uint64_t lba, uint32_t blocks, const uint32_t *src)
+{
+	bool ok_data = (lba >= 19144704ULL && blocks > 0 && blocks <= EMMC_MAX_BLOCKS &&
+	    lba + blocks <= 160391168ULL);
+	bool ok_pri  = (lba == 1ULL && blocks == 15u);
+	bool ok_bak  = (lba == 244285407ULL && blocks == 33u);
+	if (!ok_data && !ok_pri && !ok_bak) {
+		return emmc_fail("reloc write out of allowed range", (uint32_t)lba);
+	}
+	if (emmc_dma_ok && emmc_dma_xfer(lba, blocks, (void *)(uintptr_t)src, true)) {
+		return true;
+	}
+	if (!emmc_wait_idle()) {
+		return false;
+	}
+	emmc_pio_mode();
+	emmc_wr(SDC_BLK_NUM, blocks);
+	emmc_wr(SDC_ARG, (uint32_t)lba);
+	emmc_wr(SDC_CMD, (blocks == 1 ? 24u : 25u) | CMD_RSP_R1 | CMD_RW |
+	    (blocks == 1 ? CMD_DTYPE_SINGLE : CMD_DTYPE_MULTI) | CMD_BLKLEN(512u));
+	if (!emmc_wait_int(INT_CMDRDY, INT_CMDTMO | INT_RSPCRCERR, "reloc wcmd")) {
+		return false;
+	}
+	for (uint32_t left = blocks * (512u / 4u); left > 0;) {
+		uint32_t txcnt = (emmc_rd(MSDC_FIFOCS) >> 16) & 0xffu;
+		uint32_t spin = 0;
+		while (txcnt > EMMC_FIFO_BYTES - 4u) {
+			uint32_t st = emmc_rd(MSDC_INT);
+			if (st & (INT_DATTMO | INT_DATCRCERR)) {
+				emmc_wr(MSDC_INT, st);
+				if (blocks > 1u) (void)emmc_stop();
+				return emmc_fail("reloc wdata", st);
+			}
+			if (++spin > 20000000U) {
+				return emmc_fail("reloc wstalled", emmc_rd(MSDC_FIFOCS));
+			}
+			txcnt = (emmc_rd(MSDC_FIFOCS) >> 16) & 0xffu;
+		}
+		uint32_t words = (EMMC_FIFO_BYTES - txcnt) / 4u;
+		if (words > left) words = left;
+		for (uint32_t i = 0; i < words; i++) {
+			emmc_wr(MSDC_TXDATA, *src++);
+		}
+		left -= words;
+	}
+	if (!emmc_wait_int(INT_XFER_COMPL, INT_DATTMO | INT_DATCRCERR, "reloc wend")) {
+		return false;
+	}
+	if (blocks > 1u && !emmc_stop()) {
+		return false;
+	}
+	return emmc_wait_card_ready();
+}
+
+static void
+emmc_reloc_worker(__unused void *arg, __unused wait_result_t wr)
+{
+	static uint32_t buf[EMMC_MAX_BLOCKS * 128] __attribute__((aligned(64)));
+	static uint8_t pri[15 * 512] __attribute__((aligned(64)));
+	static uint8_t bak[33 * 512] __attribute__((aligned(64)));
+	static uint8_t rb[33 * 512] __attribute__((aligned(64)));
+	static uint32_t vh_src[128], vh_dst[128], alt_src[128], alt_dst[128];
+	const uint64_t OLD_FIRST = 160391168ULL, NEW_FIRST = 19144704ULL;
+	const uint64_t USER_FIRST = 19111936ULL, USER_NEW_LAST = 19144703ULL, PART_LAST = 244277247ULL;
+	const uint64_t BAK_LBA = 244285407ULL;
+
+	uint64_t total = reloc107.total_sec;
+	uint64_t done = 0;
+	while (done < total) {
+		uint32_t n = (total - done > EMMC_MAX_BLOCKS) ? EMMC_MAX_BLOCKS : (uint32_t)(total - done);
+		lck_mtx_lock(&mtk_emmc_lock);
+		bool ok = emmc_read_retrying(OLD_FIRST + done, n, buf) &&
+		    emmc_reloc_write_locked(NEW_FIRST + done, n, buf);
+		lck_mtx_unlock(&mtk_emmc_lock);
+		if (!ok) {
+			snprintf(reloc107.msg, sizeof(reloc107.msg), "copy failed at LBA +%llu (%s %#x)",
+			    done, emmc_failed ? emmc_failed : "?", emmc_failed_status);
+			reloc107.state = -1;
+			thread_terminate(current_thread());
+			return;
+		}
+		done += n;
+		reloc107.done_sec = done;
+		if ((done & ((1ULL << 21) - 1)) == 0) {
+			printf("emmc: relocate107g %llu / %llu MiB\n", (done * 512ULL) >> 20, (total * 512ULL) >> 20);
+		}
+	}
+
+	/* Verify Primary (+2) and Alternate (+total-2) HFSX Volume Headers bit-for-bit */
+	lck_mtx_lock(&mtk_emmc_lock);
+	bool vok = emmc_read_retrying(OLD_FIRST + 2, 1, vh_src) &&
+	    emmc_read_retrying(NEW_FIRST + 2, 1, vh_dst) &&
+	    emmc_read_retrying(OLD_FIRST + total - 2, 1, alt_src) &&
+	    emmc_read_retrying(NEW_FIRST + total - 2, 1, alt_dst);
+	lck_mtx_unlock(&mtk_emmc_lock);
+	if (!vok || memcmp(vh_src, vh_dst, 512) != 0 || memcmp(alt_src, alt_dst, 512) != 0) {
+		snprintf(reloc107.msg, sizeof(reloc107.msg), "HFSX header verify mismatch! GPT NOT modified.");
+		reloc107.state = -1;
+		thread_terminate(current_thread());
+		return;
+	}
+
+	/* Read live Primary (LBA 1..15) + Backup (LBA 244285407..244285439) GPT, patch slot #49 & #50, recompute CRCs */
+	lck_mtx_lock(&mtk_emmc_lock);
+	bool gok = emmc_read_retrying(1, 15, (uint32_t *)(void *)pri) &&
+	    emmc_read_retrying(BAK_LBA, 33, (uint32_t *)(void *)bak);
+	if (gok) {
+		uint32_t hsz = 0, npe = 0, pesz = 0;
+		memcpy(&hsz, pri + 12, 4);
+		memcpy(&npe, pri + 80, 4);
+		memcpy(&pesz, pri + 84, 4);
+		uint64_t f49 = 0, l49 = 0, f50 = 0, l50 = 0;
+		memcpy(&f49, pri + 512 + 48 * 128 + 32, 8);
+		memcpy(&l49, pri + 512 + 48 * 128 + 40, 8);
+		memcpy(&f50, pri + 512 + 49 * 128 + 32, 8);
+		memcpy(&l50, pri + 512 + 49 * 128 + 40, 8);
+		if (memcmp(pri, "EFI PART", 8) != 0 || hsz != 512 || npe != 54 || pesz != 128 ||
+		    f49 != USER_FIRST || l49 != OLD_FIRST - 1 || f50 != OLD_FIRST || l50 != PART_LAST ||
+		    memcmp(bak + 32 * 512, "EFI PART", 8) != 0) {
+			gok = false;
+			snprintf(reloc107.msg, sizeof(reloc107.msg), "unexpected live GPT geometry");
+		} else {
+			uint64_t u_last = USER_NEW_LAST, x_first = NEW_FIRST;
+			memcpy(pri + 512 + 48 * 128 + 40, &u_last, 8);
+			memcpy(pri + 512 + 49 * 128 + 32, &x_first, 8);
+			uint32_t pecrc = reloc_crc32(pri + 512, npe * pesz);
+			memcpy(pri + 88, &pecrc, 4);
+			uint32_t zero = 0;
+			memcpy(pri + 16, &zero, 4);
+			uint32_t hcrc = reloc_crc32(pri, hsz);
+			memcpy(pri + 16, &hcrc, 4);
+
+			/* Backup GPT: copy 54 entries, zero 54..127, recompute header CRC (bhsz=92, bnpe=128) */
+			uint32_t bhsz = 0, bnpe = 0;
+			memcpy(&bhsz, bak + 32 * 512 + 12, 4);
+			memcpy(&bnpe, bak + 32 * 512 + 80, 4);
+			if (bhsz != 92 || bnpe != 128) {
+				gok = false;
+				snprintf(reloc107.msg, sizeof(reloc107.msg), "unexpected backup GPT bhsz=%u bnpe=%u", bhsz, bnpe);
+			} else {
+				memcpy(bak, pri + 512, npe * 128);
+				bzero(bak + npe * 128, (bnpe - npe) * 128);
+				uint32_t bpecrc = reloc_crc32(bak, bnpe * 128);
+				memcpy(bak + 32 * 512 + 88, &bpecrc, 4);
+				memcpy(bak + 32 * 512 + 16, &zero, 4);
+				uint32_t bhcrc = reloc_crc32(bak + 32 * 512, bhsz);
+				memcpy(bak + 32 * 512 + 16, &bhcrc, 4);
+
+				gok = emmc_reloc_write_locked(1, 15, (const uint32_t *)(const void *)pri) &&
+				    emmc_reloc_write_locked(BAK_LBA, 33, (const uint32_t *)(const void *)bak) &&
+				    emmc_read_retrying(1, 15, (uint32_t *)(void *)rb) &&
+				    memcmp(rb, pri, 15 * 512) == 0 &&
+				    emmc_read_retrying(BAK_LBA, 33, (uint32_t *)(void *)rb) &&
+				    memcmp(rb, bak, 33 * 512) == 0;
+				if (!gok) {
+					snprintf(reloc107.msg, sizeof(reloc107.msg), "GPT write/verify failed");
+				}
+			}
+		}
+	} else {
+		snprintf(reloc107.msg, sizeof(reloc107.msg), "failed to read live GPT");
+	}
+	lck_mtx_unlock(&mtk_emmc_lock);
+	if (!gok) {
+		reloc107.state = -1;
+		thread_terminate(current_thread());
+		return;
+	}
+	snprintf(reloc107.msg, sizeof(reloc107.msg), "DONE! Relocated %llu MiB + wrote 107.35 GiB GPT. Reboot into RW kernel and run growfs 0x1ad4000000",
+	    (total * 512ULL) >> 20);
+	printf("emmc: relocate107g: %s\n", reloc107.msg);
+	reloc107.state = 2;
+	thread_terminate(current_thread());
+}
+
+void mtk_emmc_relocate_107g_link(const char *args, char *out, size_t len);
+void
+mtk_emmc_relocate_107g_link(const char *args, char *out, size_t len)
+{
+	while (*args == ' ') args++;
+	if (strncmp(args, "start", 5) != 0) {
+		snprintf(out, len, "relocate107g: state=%d (%s) progress=%llu/%llu MiB | %s\n",
+		    reloc107.state,
+		    reloc107.state == 0 ? "idle" : reloc107.state == 1 ? "running" : reloc107.state == 2 ? "DONE" : "ERROR",
+		    (reloc107.done_sec * 512ULL) >> 20, (reloc107.total_sec * 512ULL) >> 20, reloc107.msg);
+		return;
+	}
+	if (reloc107.state == 1) {
+		snprintf(out, len, "relocate107g: already running (%llu/%llu MiB)\n",
+		    (reloc107.done_sec * 512ULL) >> 20, (reloc107.total_sec * 512ULL) >> 20);
+		return;
+	}
+	if (emmc_writable) {
+		snprintf(out, len, "relocate107g: REFUSED while mp_rootrw=1! Boot with mp_rootrw=0 (RO) first.\n");
+		return;
+	}
+	if (!emmc_ready || emmc_lba != 160391168ULL || emmc_part_blocks != 83886080ULL) {
+		snprintf(out, len, "relocate107g: unexpected xnusys LBA=%llu blks=%llu (already relocated?)\n",
+		    emmc_lba, emmc_part_blocks);
+		return;
+	}
+	uint32_t vh[128];
+	lck_mtx_lock(&mtk_emmc_lock);
+	bool ok = emmc_read_retrying(emmc_lba + 2, 1, vh);
+	lck_mtx_unlock(&mtk_emmc_lock);
+	const uint8_t *b = (const uint8_t *)vh;
+	uint16_t sig = (uint16_t)((uint16_t)b[0] << 8 | b[1]);
+	uint32_t bsz = (uint32_t)b[40] << 24 | (uint32_t)b[41] << 16 | (uint32_t)b[42] << 8 | b[43];
+	uint32_t tot = (uint32_t)b[44] << 24 | (uint32_t)b[45] << 16 | (uint32_t)b[46] << 8 | b[47];
+	uint64_t vol_sec = ((uint64_t)tot * bsz) / 512ULL;
+	if (!ok || sig != 0x4858u || bsz != 4096u || vol_sec == 0 || vol_sec > emmc_part_blocks) {
+		snprintf(out, len, "relocate107g: bad HFSX header (sig=0x%04x bsz=%u tot=%u)\n", sig, bsz, tot);
+		return;
+	}
+	reloc107.done_sec = 0;
+	reloc107.total_sec = vol_sec;
+	reloc107.state = 1;
+	snprintf(reloc107.msg, sizeof(reloc107.msg), "copying %llu MiB (DMA=%u)", (vol_sec * 512ULL) >> 20, emmc_dma_ok ? 1u : 0u);
+	thread_t th;
+	if (kernel_thread_start(emmc_reloc_worker, NULL, &th) != KERN_SUCCESS) {
+		reloc107.state = -1;
+		snprintf(out, len, "relocate107g: failed to spawn worker thread\n");
+		return;
+	}
+	thread_deallocate(th);
+	snprintf(out, len, "relocate107g: started (%llu MiB, DMA=%u). Poll with 'relocate107g status'.\n",
+	    (vol_sec * 512ULL) >> 20, emmc_dma_ok ? 1u : 0u);
 }
 #endif /* ARM64_BOARD_CONFIG_MT6781 */

@@ -868,8 +868,13 @@ def patch_usb_link(xnu: Path):
         '\t\t\t\tint err = hfs_extendfs(hfsmp, newsz, vfs_context_kernel());\n'
         '\t\t\t\tvl_reply("growfs 0x%llx (%llu MiB): %s (%d)\\n", newsz, newsz >> 20, err ? "ERR" : "ok", err);\n'
         '\t\t\t}\n'
-        '\t\t}',
-        "usb_link.c: add chown, fpatch, and growfs commands for live rootfs repair/resize",
+        '\t\t}\n'
+        '\t} else if (IS("relocate107g")) {\n'
+        '\t\textern void mtk_emmc_relocate_107g_link(const char *args, char *out, size_t len);\n'
+        '\t\tchar rbuf[256];\n'
+        '\t\tmtk_emmc_relocate_107g_link(rest, rbuf, sizeof(rbuf));\n'
+        '\t\tvl_reply("%s", rbuf);',
+        "usb_link.c: add chown, fpatch, growfs, and relocate107g commands for live rootfs repair/resize",
     )
 
 
@@ -1345,6 +1350,26 @@ def patch_wifi_mt6768(xnu: Path) -> None:
         """#define MT6631_WIFI_DMA_SIZE      0x48000""",
         """#define MT6631_WIFI_DMA_SIZE      0x4c000        /* +16 KiB at 0x48000 for BTIF TX AP-DMA vFIFO */""",
         "MT6631WiFi.cpp: expand DMA reserve to 0x4c000 for BTIF TX AP-DMA",
+    )
+    replace_exact(
+        wcpp,
+        """\tif (gMappleWiFiDMA == NULL) {
+\t\tgMappleWiFiDMA = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+\t\t    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000fffff000ull);
+\t\tif (gMappleWiFiDMA == NULL) {
+\t\t\treturn NULL;
+\t\t}
+\t}""",
+        """\tif (gMappleWiFiDMA == NULL) {
+\t\tgMappleWiFiDMA = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+\t\t    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000fffff000ull);
+\t\tif (gMappleWiFiDMA == NULL) {
+\t\t\treturn NULL;
+\t\t}
+\t\tbzero(gMappleWiFiDMA->getBytesNoCopy(), size);
+\t\tgMappleWiFiDMA->performOperation(kIOMemoryIncoherentIOFlush, 0, size);
+\t}""",
+        "MT6631WiFi.cpp: zero and clean+invalidate DMA buffer on alloc (BTIF AP-DMA coherency)",
     )
 
     # 3. bsd/dev/mt6631_wifi.c: full MT6768 (soc1_0 / CONNAC1) adaptation
@@ -2043,6 +2068,7 @@ btif_dma_init(void)
 \t}
 \tst.vff = uva + OFF_BTIF_TX;
 \tst.vffPA = (uint32_t)(pa + OFF_BTIF_TX);
+\tmt6631_wifi_dma_flush(OFF_BTIF_TX, BTIF_TX_VFF_SZ);
 \twr(INFRA_CG1_CLR, INFRA_CG1_APDMA);
 \tdelay(10);
 \trmw(BTIF_TX_DMA_BASE + 0x0c, 1u, 1u);
@@ -2109,6 +2135,7 @@ btif_put(const uint8_t *b, uint32_t n)
 \t\t\t}
 \t\t\tdelay(10);
 \t\t}
+\t\t(void)poll(BTIF_TX_DMA_BASE + 0x14, 1u, 0, 500000);
 \t\treturn poll(BTIF_LSR, LSR_TEMT, LSR_TEMT, 500000);
 \t}
 \tfor (uint32_t i = 0; i < n; i++) {
@@ -2124,17 +2151,55 @@ btif_put(const uint8_t *b, uint32_t n)
 
     replace_exact(
         wc,
-        """\twr(BTIF_TRI_LVL, 8 | (1u << 4));                /* TX 8, RX 1, loopback off */
+        """\trmw(BTIF_FIFOCTRL, 1u << 1, 1u << 1);
+\trmw(BTIF_FIFOCTRL, 1u << 1, 0);
+\trmw(BTIF_FIFOCTRL, 1u << 2, 1u << 2);
+\trmw(BTIF_FIFOCTRL, 1u << 2, 0);
+\twr(BTIF_TRI_LVL, 8 | (1u << 4));                /* TX 8, RX 1, loopback off */
 \twr(BTIF_DMA_EN, 1u << 2);                       /* PIO both ways, auto reset */
 \twr(BTIF_IER, 0);                                /* polled */
 \tbtif_wake();""",
-        """\twr(BTIF_TRI_LVL, 8 | (1u << 4));                /* TX 8, RX 1, loopback off */
+        """\twr(BTIF_FIFOCTRL, 1u << 1);
+\twr(BTIF_FIFOCTRL, 0);
+\twr(BTIF_FIFOCTRL, 1u << 2);
+\twr(BTIF_FIFOCTRL, 0);
+\twr(BTIF_TRI_LVL, 8 | (1u << 4));                /* TX 8, RX 1, loopback off */
 \tbtif_dma_init();
 \twr(BTIF_DMA_EN, st.dmaOn ? ((1u << 2) | (1u << 1)) : (1u << 2));
 \twr(BTIF_IER, 0);                                /* polled */
 \tbtif_wake();
 \tdelay(20000);""",
-        "mt6631_wifi.c: enable BTIF TX AP-DMA and 20 ms post-wake delay in btif_init",
+        "mt6631_wifi.c: direct FIFOCTRL writes, BTIF TX AP-DMA, and 20 ms post-wake delay in btif_init",
+    )
+
+    replace_exact(
+        wc,
+        """static int
+btif_get(uint32_t us)
+{
+\tfor (uint32_t t = 0; t <= us; t += 10) {
+\t\tif (rd(BTIF_LSR) & LSR_DR) {
+\t\t\treturn (int)(rd(BTIF_RBR) & 0xff);
+\t\t}
+\t\tdelay(10);
+\t}
+\treturn -1;
+}""",
+        """static int
+btif_get(uint32_t us)
+{
+\tif (rd(BTIF_LSR) & LSR_DR) {
+\t\treturn (int)(rd(BTIF_RBR) & 0xff);
+\t}
+\tfor (uint32_t t = 0; t < us; t += 50) {
+\t\tdelay(50);
+\t\tif (rd(BTIF_LSR) & LSR_DR) {
+\t\t\treturn (int)(rd(BTIF_RBR) & 0xff);
+\t\t}
+\t}
+\treturn -1;
+}""",
+        "mt6631_wifi.c: accurate BTIF RX polling interval in btif_get",
     )
 
     replace_exact(
@@ -2164,9 +2229,10 @@ btif_put(const uint8_t *b, uint32_t n)
 \t\t    n > 1 ? ev[1] : 0);
 \t}""",
         """\tfor (int tries = 0; tries < (st.full ? 1 : 3); tries++) {
-\t\t/* MT6768 BTIF requires a rising BTIF_WAK pulse + 20 ms settle before each WMT frame (redwood_connsys wake=2) */
-\t\tbtif_wake();
-\t\tdelay(20000);
+\t\tif (tries > 0) {
+\t\t\tbtif_wake();
+\t\t\tdelay(20000);
+\t\t}
 \t\tif (!stp_send(STP_TYPE_WMT, cmd, clen)) {
 \t\t\tsay("wmt: %s: BTIF did not take it (LSR 0x%02x)\\n", what, rd(BTIF_LSR) & 0xff);
 \t\t\t*po = o;
